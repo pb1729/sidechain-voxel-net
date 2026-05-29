@@ -1,0 +1,159 @@
+from dataclasses import dataclass
+
+import torch
+from torch import nn
+
+from umup_layers.residual_layers import (
+  get_param_groups, scale_param_lrs, UMUPConv3d, UMUPTanhGated, UMUPResiduals)
+from util import must_be
+from source_save import get_current_source, source_dict_diff
+
+
+CIF_DATASET_PATH = "cath-cif"
+SAVE_PATH = "models/vae_6.pt"
+
+
+@dataclass
+class VAEConfig:
+  batch:int
+  chan_dens_fields:int
+  chan_1:int
+  L_1:int
+  chan_2:int
+  L_2:int
+  chan_out:int
+  sigma_z:float = 1.0
+  lr:float = 0.1
+  λ:float = 1e-6
+
+class VAEEncoder(nn.Module):
+  def __init__(self, conf:VAEConfig):
+    super().__init__()
+    self.readin = UMUPConv3d(conf.chan_dens_fields, conf.chan_1, (1, 1, 1), (0, 0, 0), readin=True)
+    self.layers_1 = UMUPResiduals(conf.L_1, lambda j: UMUPTanhGated(conf.chan_1))
+    self.compress = UMUPConv3d(conf.chan_1, conf.chan_2, (2, 2, 2), (0, 0, 0), stride=(2, 2, 2))
+    self.layers_2 = UMUPResiduals(conf.L_2, lambda j: UMUPTanhGated(conf.chan_2))
+    self.readout = UMUPConv3d(conf.chan_2, conf.chan_out, (1, 1, 1), (0, 0, 0))
+  def forward(self, x):
+    x = self.readin(x)
+    x = self.layers_1(x)
+    x = self.compress(x)
+    x = self.layers_2(x)
+    x = self.readout(x)
+    return x
+
+class VAEDecoder(nn.Module):
+  def __init__(self, conf:VAEConfig):
+    super().__init__()
+    self.readin = UMUPConv3d(conf.chan_out, conf.chan_2, (1, 1, 1), (0, 0, 0))
+    self.layers_2 = UMUPResiduals(conf.L_2, lambda j: UMUPTanhGated(conf.chan_2))
+    self.expand = UMUPConv3d(conf.chan_1, conf.chan_2, (2, 2, 2), (0, 0, 0), stride=(2, 2, 2), transpose=True)
+    self.layers_1 = UMUPResiduals(conf.L_1, lambda j: UMUPTanhGated(conf.chan_1))
+    self.readout = UMUPConv3d(conf.chan_1, conf.chan_dens_fields, (1, 1, 1), (0, 0, 0), readout=True)
+  def forward(self, x):
+    x = self.readin(x)
+    x = self.layers_2(x)
+    x = self.expand(x)
+    x = self.layers_1(x)
+    x = self.readout(x)
+    return x
+
+class VAE:
+  def __init__(self, conf:VAEConfig):
+    self.history = {}
+    self.conf = conf
+    self.enc = VAEEncoder(conf)
+    self.dec = VAEDecoder(conf)
+    self.source = get_current_source()
+    self.optim = None
+  def to(self, device):
+    self.enc.to(device)
+    self.dec.to(device)
+    return self
+  def record(self, i:int, nm:str, val):
+    if nm not in self.history:
+      self.history[nm] = []
+    self.history[nm].append((i, val))
+  def to_dict(self):
+    return {
+      "history": self.history,
+      "conf": vars(self.conf),
+      "enc": self.enc.state_dict(),
+      "dec": self.dec.state_dict(),
+      "source": self.source,
+    }
+  @staticmethod
+  def from_dict(d):
+    ans = VAE(VAEConfig(**d["conf"]))
+    ans.history = d["history"]
+    ans.enc.load_state_dict(d["enc"])
+    ans.dec.load_state_dict(d["dec"])
+    curr_source = ans.source
+    ans.source = d["source"]
+    source_diff = source_dict_diff(curr_source, ans.source)
+    # print alerts to source changes
+    for add in source_diff["added"]:
+      print("added:", add)
+    for rem in source_diff["removed"]:
+      print("removed:", rem)
+    for chg in source_diff["changed"]:
+      print("changed:", chg)
+      print(source_diff["changed"][chg]["diff"])
+    # return the answer
+    return ans
+  def step(self, i:int, x):
+    """ MUTATES self """
+    if self.optim is None:
+      self.optim = torch.optim.Adam(
+        scale_param_lrs(self.conf.lr, get_param_groups(self.enc, self.dec)),
+        betas=(0.9, 0.999)
+      )
+    self.record(i, "input_ms", (x**2).mean().item())
+    # encode and decode
+    z = self.enc(x)
+    z_noised = z + self.conf.sigma_z*torch.randn_like(z)
+    x_pred = self.dec(z_noised)
+    mserr = ((x_pred - x)**2).mean()
+    mslat = (z**2).mean()
+    loss = mserr + self.conf.λ*mslat
+    # update
+    self.optim.zero_grad()
+    loss.backward()
+    self.optim.step()
+    self.record(i, "loss", loss.item())
+    self.record(i, "mserr", mserr.item())
+    self.record(i, "mslat", mslat.item())
+    self.record(i, "grid_dims", x.shape[-3:])
+
+
+if __name__ == "__main__":
+  from density_dataset import CHAN_DENSFN_1, make_density_batch_loader
+  batch = 16
+  chan_1 = 64
+  chan_2 = 128
+  L = 5
+  chan_latent = 16
+  holdout_percent = 10
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  print("device:", device)
+  print(SAVE_PATH)
+  conf = VAEConfig(batch, CHAN_DENSFN_1, chan_1, L, chan_2, L, chan_latent)
+  vae = VAE(conf).to(device)
+  i = 0
+  for epoch in range(10):
+    vae.record(i, "start_epoch", epoch)
+    dataloader = make_density_batch_loader(CIF_DATASET_PATH, conf.batch,
+      holdout_percent=holdout_percent, holdout=False)
+    for x in dataloader:
+      x = x.to(device)
+      vae.step(i, x)
+      _, loss = vae.history["loss"][-1]
+      _, mserr = vae.history["mserr"][-1]
+      _, mslat = vae.history["mslat"][-1]
+      _, input_ms = vae.history["input_ms"][-1]
+      print(i, f"loss={loss}, normed_rmserr={(mserr/(input_ms+1e-9))**0.5}, rmslat={mslat**0.5}")
+      if i % 10 == 0:
+        torch.save(vae.to_dict(), SAVE_PATH)
+      i += 1
+  torch.save(vae.to_dict(), SAVE_PATH)
+
