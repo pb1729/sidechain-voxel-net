@@ -55,3 +55,9 @@ python train_vae.py
 
 Check what is printed for "device" when the training run starts. It should be something like `cuda:0` unless you're running on CPU only.
 
+## train the flow model
+
+```
+python train_flow_model.py
+```
+
