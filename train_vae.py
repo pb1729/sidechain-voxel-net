@@ -10,7 +10,7 @@ from source_save import get_current_source, source_dict_diff
 
 
 CIF_DATASET_PATH = "cath-cif"
-SAVE_PATH = "models/vae_6.pt"
+SAVE_PATH = "models/vae_8.pt"
 
 
 @dataclass
@@ -25,6 +25,7 @@ class VAEConfig:
   sigma_z:float = 1.0
   lr:float = 0.1
   λ:float = 1e-6
+  autocast:bool = False
 
 class VAEEncoder(nn.Module):
   def __init__(self, conf:VAEConfig):
@@ -70,6 +71,10 @@ class VAE:
     self.enc.to(device)
     self.dec.to(device)
     return self
+  def eval(self):
+    self.enc.eval()
+    self.dec.eval()
+    return self
   def record(self, i:int, nm:str, val):
     if nm not in self.history:
       self.history[nm] = []
@@ -90,7 +95,7 @@ class VAE:
     ans.dec.load_state_dict(d["dec"])
     curr_source = ans.source
     ans.source = d["source"]
-    source_diff = source_dict_diff(curr_source, ans.source)
+    source_diff = source_dict_diff(ans.source, curr_source)
     # print alerts to source changes
     for add in source_diff["added"]:
       print("added:", add)
@@ -110,12 +115,13 @@ class VAE:
       )
     self.record(i, "input_ms", (x**2).mean().item())
     # encode and decode
-    z = self.enc(x)
-    z_noised = z + self.conf.sigma_z*torch.randn_like(z)
-    x_pred = self.dec(z_noised)
-    mserr = ((x_pred - x)**2).mean()
-    mslat = (z**2).mean()
-    loss = mserr + self.conf.λ*mslat
+    with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=self.conf.autocast):
+      z = self.enc(x)
+      z_noised = z + self.conf.sigma_z*torch.randn_like(z)
+      x_pred = self.dec(z_noised)
+      mserr = ((x_pred - x)**2).mean()
+      mslat = (z**2).mean()
+      loss = mserr + self.conf.λ*mslat
     # update
     self.optim.zero_grad()
     loss.backward()
@@ -128,16 +134,17 @@ class VAE:
 
 if __name__ == "__main__":
   from density_dataset import CHAN_DENSFN_1, make_density_batch_loader
-  batch = 16
+  batch = 32
   chan_1 = 64
   chan_2 = 128
   L = 5
   chan_latent = 16
+  autocast = True
   holdout_percent = 10
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print("device:", device)
   print(SAVE_PATH)
-  conf = VAEConfig(batch, CHAN_DENSFN_1, chan_1, L, chan_2, L, chan_latent)
+  conf = VAEConfig(batch, CHAN_DENSFN_1, chan_1, L, chan_2, L, chan_latent, autocast=autocast)
   vae = VAE(conf).to(device)
   i = 0
   for epoch in range(10):
@@ -151,7 +158,7 @@ if __name__ == "__main__":
       _, mserr = vae.history["mserr"][-1]
       _, mslat = vae.history["mslat"][-1]
       _, input_ms = vae.history["input_ms"][-1]
-      print(i, f"loss={loss}, normed_rmserr={(mserr/(input_ms+1e-9))**0.5}, rmslat={mslat**0.5}")
+      print(f"{i} loss={loss}, normed_rmserr={(mserr/(input_ms+1e-9))**0.5}, rmslat={mslat**0.5}")
       if i % 10 == 0:
         torch.save(vae.to_dict(), SAVE_PATH)
       i += 1

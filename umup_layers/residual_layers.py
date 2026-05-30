@@ -96,10 +96,10 @@ class UMUPConv3d(nn.Module):
         self.lr_scale = LrScale(k*chan_in)
   def parameters_with_lr_scalings(self):
     return [(self.lr_scale, self.weight)]
-  def forward(self, x, with_bias=None):
+  def forward(self, x, with_bias=None, output_padding=0):
     if self.transpose:
       return self.scale*nn.functional.conv_transpose3d(x, self.weight, bias=with_bias,
-        padding=self.padding, stride=self.stride)
+        padding=self.padding, stride=self.stride, output_padding=output_padding)
     else:
       return self.scale*nn.functional.conv3d(x, self.weight, bias=with_bias,
         padding=self.padding, stride=self.stride)
