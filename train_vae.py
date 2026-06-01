@@ -10,7 +10,7 @@ from source_save import get_current_source, source_dict_diff
 
 
 CIF_DATASET_PATH = "cath-cif"
-SAVE_PATH = "models/vae_8.pt"
+SAVE_PATH = "models/vae_12.pt"
 
 
 @dataclass
@@ -113,13 +113,17 @@ class VAE:
         scale_param_lrs(self.conf.lr, get_param_groups(self.enc, self.dec)),
         betas=(0.9, 0.999)
       )
-    self.record(i, "input_ms", (x**2).mean().item())
+    # make tensors smaller so we don't run out of memory
+    gx, gy, gz = x.shape[-3:]
+    crop_x, crop_y, crop_z = max(1, (gx - 40)//2), max(1, (gy - 40)//2), max(1, (gz - 40)//2)
+    x = x[..., crop_x:-crop_x, crop_y:-crop_y, crop_z:-crop_z]
     # encode and decode
     with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=self.conf.autocast):
       z = self.enc(x)
       z_noised = z + self.conf.sigma_z*torch.randn_like(z)
       x_pred = self.dec(z_noised)
-      mserr = ((x_pred - x)**2).mean()
+      weights = torch.tanh(10*abs(x).sum(1, keepdim=True)) + 0.05
+      mserr = (((x_pred - x)**2)*weights).mean() / weights.mean()
       mslat = (z**2).mean()
       loss = mserr + self.conf.λ*mslat
     # update
@@ -130,14 +134,16 @@ class VAE:
     self.record(i, "mserr", mserr.item())
     self.record(i, "mslat", mslat.item())
     self.record(i, "grid_dims", x.shape[-3:])
+    self.record(i, "ms_x_pred", ((weights*x_pred**2).mean()/weights.mean()).item())
+    self.record(i, "input_ms", ((weights*x**2).mean()/weights.mean()).item())
 
 
 if __name__ == "__main__":
   from density_dataset import CHAN_DENSFN_1, make_density_batch_loader
-  batch = 32
+  batch = 8
   chan_1 = 64
-  chan_2 = 128
-  L = 5
+  chan_2 = 96
+  L = 3
   chan_latent = 16
   autocast = True
   holdout_percent = 10
@@ -158,7 +164,8 @@ if __name__ == "__main__":
       _, mserr = vae.history["mserr"][-1]
       _, mslat = vae.history["mslat"][-1]
       _, input_ms = vae.history["input_ms"][-1]
-      print(f"{i} loss={loss}, normed_rmserr={(mserr/(input_ms+1e-9))**0.5}, rmslat={mslat**0.5}")
+      _, ms_x_pred = vae.history["ms_x_pred"][-1]
+      print(f"{i} loss={loss}, rmslat={mslat**0.5}, input_rms={input_ms**0.5}, rms_x_pred={ms_x_pred**0.5}")
       if i % 10 == 0:
         torch.save(vae.to_dict(), SAVE_PATH)
       i += 1

@@ -157,8 +157,10 @@ class CifDensityBatchDataset(IterableDataset):
             batch_files = shuffled_files[start:start + self.batch_size]
             if len(batch_files) < self.batch_size and self.drop_last:
                 continue
-            yield make_density_batch(batch_files, rng=rng)
-
+            try:
+                batch = make_density_batch(batch_files, rng=rng)
+            except: continue
+            yield batch
 
 def make_density_batch_loader(
     cif_paths: str | Path | Iterable[str | Path],
