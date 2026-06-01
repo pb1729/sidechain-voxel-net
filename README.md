@@ -26,7 +26,7 @@ First clone this repo.
 
 We use the CATH-S40 dataset, non-redundant version, from here:
 
-https://zenodo.org/records/8388270/files/cath-dataset-nonredundant-S40.pdb.tgz?download=1
+https://zenodo.org/records/18506092/files/cath-cif.tar.gz?download=1
 
 Steps: Download and extract. Should produce a directory named `cath-cif`. We want this under the project root directory, so move it there if it's not already there.
 
