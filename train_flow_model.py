@@ -5,7 +5,7 @@ from torch import nn
 
 from umup_layers.residual_layers import (
   get_param_groups, scale_param_lrs, UMUPConv3d, UMUPTanhGated, UMUPResiduals)
-from util import must_be
+from util import must_be, annotate_path
 from source_save import get_current_source, source_dict_diff
 from train_vae import VAE
 
@@ -156,7 +156,6 @@ class FlowModel:
     self.record(i, "grid_dims", z.shape[-3:])
 
 
-
 if __name__ == "__main__":
   from density_dataset import make_density_batch_loader
   batch = 32
@@ -181,6 +180,7 @@ if __name__ == "__main__":
       if i % 10 == 0:
         torch.save(flowmodel.to_dict(), SAVE_PATH)
       i += 1
+    torch.save(flowmodel.to_dict(), annotate_path(SAVE_PATH, f"epoch_{epoch}"))
   torch.save(flowmodel.to_dict(), SAVE_PATH)
 
 

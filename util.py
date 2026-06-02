@@ -11,3 +11,10 @@ class _MustBe:
       assert key == value, "must_be[%d] does not match dimension %d" % (key, value)
 must_be = _MustBe()
 
+
+def annotate_path(orig_path:str, annotation:str):
+  parts = orig_path.split(".")
+  parts = parts[:-1] + annotation + parts[-1:]
+  return ".".join(parts)
+
+
