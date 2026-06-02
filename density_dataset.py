@@ -167,7 +167,7 @@ def make_density_batch_loader(
     batch_size: int,
     *,
     seed: int | None = None,
-    drop_last: bool = False,
+    drop_last: bool = True,
     num_workers: int = 0,
     holdout_percent: int | float = 0,
     holdout: bool = False,

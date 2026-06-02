@@ -5,12 +5,12 @@ from torch import nn
 
 from umup_layers.residual_layers import (
   get_param_groups, scale_param_lrs, UMUPConv3d, UMUPTanhGated, UMUPResiduals)
-from util import must_be
+from util import must_be, annotate_path
 from source_save import get_current_source, source_dict_diff
 
 
 CIF_DATASET_PATH = "cath-cif"
-SAVE_PATH = "models/vae_12.pt"
+SAVE_PATH = "models/vae_14.pt"
 
 
 @dataclass
@@ -133,6 +133,7 @@ class VAE:
     self.record(i, "loss", loss.item())
     self.record(i, "mserr", mserr.item())
     self.record(i, "mslat", mslat.item())
+    self.record(i, "batch_size", x.shape[0])
     self.record(i, "grid_dims", x.shape[-3:])
     self.record(i, "ms_x_pred", ((weights*x_pred**2).mean()/weights.mean()).item())
     self.record(i, "input_ms", ((weights*x**2).mean()/weights.mean()).item())
@@ -145,15 +146,16 @@ if __name__ == "__main__":
   chan_2 = 96
   L = 3
   chan_latent = 16
+  sigma_z = 0.1
   autocast = True
   holdout_percent = 10
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print("device:", device)
   print(SAVE_PATH)
-  conf = VAEConfig(batch, CHAN_DENSFN_1, chan_1, L, chan_2, L, chan_latent, autocast=autocast)
+  conf = VAEConfig(batch, CHAN_DENSFN_1, chan_1, L, chan_2, L, chan_latent, autocast=autocast, sigma_z=sigma_z)
   vae = VAE(conf).to(device)
   i = 0
-  for epoch in range(10):
+  for epoch in range(1):
     vae.record(i, "start_epoch", epoch)
     dataloader = make_density_batch_loader(CIF_DATASET_PATH, conf.batch,
       holdout_percent=holdout_percent, holdout=False)
@@ -169,5 +171,5 @@ if __name__ == "__main__":
       if i % 10 == 0:
         torch.save(vae.to_dict(), SAVE_PATH)
       i += 1
+    torch.save(vae.to_dict(), annotate_path(SAVE_PATH, f"epoch_{epoch}"))
   torch.save(vae.to_dict(), SAVE_PATH)
-
