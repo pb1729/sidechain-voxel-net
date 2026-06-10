@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 
 import torch
 from torch import nn
@@ -7,19 +8,19 @@ from umup_layers.residual_layers import (
   get_param_groups, scale_param_lrs, UMUPConv3d, UMUPTanhGated, UMUPResiduals)
 from util import must_be, annotate_path
 from source_save import get_current_source, source_dict_diff
-from train_vae import VAE
+from big_convs_3d import gaussian_blur_3d
 
 
 CIF_DATASET_PATH = "cath-cif"
-SAVE_PATH = "models/flownet_8.pt"
+SAVE_PATH = "models/flownet_4.pt"
 
 
 @dataclass
 class FlowConfig:
   batch:int
-  chan_latent:int
+  chan_dens:int
   chan_L_list:list[tuple[int, int]]
-  vae_path:str
+  blur_list:list[float]
   lr:float = 0.1
   autocast:bool = False
   
@@ -50,7 +51,7 @@ class UNet3d(nn.Module):
     super().__init__()
     self.N = len(conf.chan_L_list)
     chan_0 = conf.chan_L_list[0][0]
-    self.readin = LinearReadinWithBias(conf.chan_latent, chan_0)
+    self.readin = LinearReadinWithBias(conf.chan_dens, chan_0)
     self.input_residuals = nn.ModuleList([
       UMUPResiduals(L, lambda j: UMUPTanhGated(chan, t_depend=True))
       for chan, L in conf.chan_L_list
@@ -67,7 +68,7 @@ class UNet3d(nn.Module):
       UMUPResiduals(L, lambda j: UMUPTanhGated(chan, t_depend=True))
       for chan, L in conf.chan_L_list
     ])
-    self.readout = UMUPConv3d(chan_0, conf.chan_latent, (1, 1, 1), (0, 0, 0), readout=True)
+    self.readout = UMUPConv3d(chan_0, conf.chan_dens, (1, 1, 1), (0, 0, 0), readout=True)
   def forward(self, x, t):
     """ x: (batch, chan_latent, H, W, L)
         t: (batch, 1, H, W, L) """
@@ -95,12 +96,9 @@ class FlowModel:
     self.conf = conf
     self.model = UNet3d(conf)
     self.source = get_current_source()
-    self.vae = VAE.from_dict(torch.load(conf.vae_path)).eval() # vae is inference only
     self.optim = None
-    assert self.vae.conf.chan_out == self.conf.chan_latent
   def to(self, device):
     self.model.to(device)
-    self.vae.to(device)
     return self
   def record(self, i:int, nm:str, val):
     if nm not in self.history:
@@ -138,35 +136,60 @@ class FlowModel:
         scale_param_lrs(self.conf.lr, get_param_groups(self.model)),
         betas=(0.9, 0.999)
       )
-    # encode and decode
+    # make tensors smaller so we don't run out of memory
+    gx, gy, gz = x.shape[-3:]
+    crop_x, crop_y, crop_z = max(1, (gx - 48)//2), max(1, (gy - 48)//2), max(1, (gz - 48)//2)
+    x = x[..., crop_x:-crop_x, crop_y:-crop_y, crop_z:-crop_z]
+    ε = torch.randn_like(x)
+    t = torch.rand(x.shape[0], 1, 1, 1, 1, device=x.device).expand(-1, 1, *x.shape[-3:])
+    with torch.autocast(device_type=x.device.type, enabled=False):
+      x_mix = t*x + (1. - t)*ε
+      v = x - ε
     with torch.autocast(device_type=x.device.type, dtype=torch.bfloat16, enabled=self.conf.autocast):
-      z = self.vae.enc(x)
-      t = torch.rand(self.conf.batch)**2 # bias towards low t
-      t = t[:, None, None, None, None].expand(-1, 1, *z.shape[-3:])
-      ε = torch.randn_like(z)
-      z_mix = t*z + (1. - t)*ε
-      v = z - ε
-      v_pred = self.model(z_mix, t)
-      loss = ((v_pred - v)**2).mean()
+      v_pred = self.model(x_mix, t)
+      sqerrs = []
+      sqerrs.append(((v_pred - v)**2).mean())
+      for blur in self.conf.blur_list:
+        v = gaussian_blur_3d(v, blur)
+        v_pred = gaussian_blur_3d(v_pred, blur)
+        sqerrs.append(((v_pred - v)**2).mean())
+      loss = sum(sqerrs)
     # update
     self.optim.zero_grad()
     loss.backward()
     self.optim.step()
+    # record metrics
+    self.record(i, "blur_sqerrs", [sqerr.item() for sqerr in sqerrs])
     self.record(i, "loss", loss.item())
-    self.record(i, "grid_dims", z.shape[-3:])
+    self.record(i, "grid_dims", x.shape[-3:])
+  def infer(self, ε, steps=32):
+    self.model.eval()
+    batch, must_be[self.conf.chan_dens], gx, gy, gz = ε.shape
+    for i in range(steps):
+      t_value = 1.0 - (0.5 + i)/steps
+      t_batch = t_value + torch.zeros(batch, device=ε.device)
+      t = t[:, None, None, None, None]
+      with torch.autocast(device_type=ε.device.type, dtype=torch.bfloat16, enabled=self.conf.autocast):
+        v = self.model(ε, t)
+      ε = ε - v*(1/steps)
+    return ε
 
 
 if __name__ == "__main__":
-  from density_dataset import make_density_batch_loader
-  batch = 32
-  chan_latent = 16
+  from density_dataset import CHAN_DENSFN_1, make_density_batch_loader
+  batch = 2
   chan_L_list = [(64, 5), (128, 5), (256, 5), (512, 4)]
-  vae_path = "models/vae_8.pt"
   autocast = True
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print("device:", device)
   print(SAVE_PATH)
-  conf = FlowConfig(batch, chan_latent, chan_L_list, vae_path, autocast=autocast)
+  conf = FlowConfig(
+    batch,
+    CHAN_DENSFN_1,
+    chan_L_list,
+    [2., 4., 6., 8.],
+    autocast=autocast,
+  )
   flowmodel = FlowModel(conf).to(device)
   i = 0
   for epoch in range(40):
