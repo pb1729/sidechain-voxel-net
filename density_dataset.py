@@ -52,11 +52,11 @@ def cif_to_density_tensor(
     return torch.from_numpy(np.ascontiguousarray(density))
 
 
-def _random_padding(size: int, target_size: int, rng: np.random.Generator) -> tuple[int, int]:
+def _centered_padding(size: int, target_size: int) -> tuple[int, int]:
     total_padding = int(target_size - size)
     if total_padding < 0:
         raise ValueError("target size must be at least the tensor size")
-    left_padding = int(rng.integers(0, total_padding + 1))
+    left_padding = total_padding // 2
     return left_padding, total_padding - left_padding
 
 def _slice_to_even(arr):
@@ -91,8 +91,8 @@ def make_density_batch(
     """Convert CIF files to a zero-padded density batch.
 
     Each sample is encoded as (chan, H, W, L). Samples are padded to the largest
-    H/W/L in the batch, with each axis' padding split randomly between the two
-    sides, then stacked to (batch, chan, H_max, W_max, L_max).
+    H/W/L in the batch, with each axis' padding split as evenly as possible
+    between opposite sides, then stacked to (batch, chan, H_max, W_max, L_max).
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -111,7 +111,7 @@ def make_density_batch(
     for batch_i, tensor in enumerate(tensors):
         slices = [batch_i, slice(None)]
         for axis, target_size in enumerate(max_shape, start=1):
-            left_padding, _right_padding = _random_padding(tensor.shape[axis], target_size, rng)
+            left_padding, _right_padding = _centered_padding(tensor.shape[axis], target_size)
             slices.append(slice(left_padding, left_padding + tensor.shape[axis]))
         batch[tuple(slices)] = tensor
 

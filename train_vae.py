@@ -10,7 +10,7 @@ from source_save import get_current_source, source_dict_diff
 
 
 CIF_DATASET_PATH = "cath-cif"
-SAVE_PATH = "models/vae_14.pt"
+SAVE_PATH = "models/vae_16.pt"
 
 
 @dataclass
@@ -23,7 +23,7 @@ class VAEConfig:
   L_2:int
   chan_out:int
   sigma_z:float = 1.0
-  lr:float = 0.1
+  lr:float = 0.05
   λ:float = 1e-6
   autocast:bool = False
 
@@ -122,7 +122,9 @@ class VAE:
       z = self.enc(x)
       z_noised = z + self.conf.sigma_z*torch.randn_like(z)
       x_pred = self.dec(z_noised)
-      weights = torch.tanh(10*abs(x).sum(1, keepdim=True)) + 0.05
+      channel_weights = 1./(0.1 + abs(x).sum((-3, -2, -1), keepdim=True))
+      channel_weights = channel_weights/channel_weights.mean(1, keepdim=True)
+      weights = channel_weights*torch.tanh(10*abs(x).sum(1, keepdim=True)) + 0.05
       mserr = (((x_pred - x)**2)*weights).mean() / weights.mean()
       mslat = (z**2).mean()
       loss = mserr + self.conf.λ*mslat
@@ -155,7 +157,7 @@ if __name__ == "__main__":
   conf = VAEConfig(batch, CHAN_DENSFN_1, chan_1, L, chan_2, L, chan_latent, autocast=autocast, sigma_z=sigma_z)
   vae = VAE(conf).to(device)
   i = 0
-  for epoch in range(1):
+  for epoch in range(3):
     vae.record(i, "start_epoch", epoch)
     dataloader = make_density_batch_loader(CIF_DATASET_PATH, conf.batch,
       holdout_percent=holdout_percent, holdout=False)

@@ -8,8 +8,10 @@ import os
 import sys
 
 import numpy as np
+import torch
 
 from density_fns import DENSFN_FORWARD_1_CHANNELS, densfn_forward_1
+from kspace_ops import blur as kspace_blur, nf_1
 from parse_cif import read_protein_cif_with_codes
 
 
@@ -136,6 +138,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="standard deviation of Gaussian noise added to the density field; default: 0.0",
     )
     parser.add_argument(
+        "--kspace-blur",
+        action="store_true",
+        help="show an extra t slider for k-space blurring/noising",
+    )
+    parser.add_argument(
+        "--blur-max",
+        type=float,
+        default=8.0,
+        help="maximum k-space Gaussian blur sigma for --kspace-blur; default: 8.0",
+    )
+    parser.add_argument(
+        "--kspace-scale",
+        type=float,
+        default=1.5,
+        help="FFT padding scale for --kspace-blur; default: 1.5",
+    )
+    parser.add_argument(
+        "--initial-t",
+        type=float,
+        default=1.0,
+        help="initial t value for --kspace-blur; default: 1.0",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -214,6 +239,12 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--smoothing must be non-negative")
     if args.noise_level < 0.0:
         raise ValueError("--noise-level must be non-negative")
+    if args.blur_max < 0.0:
+        raise ValueError("--blur-max must be non-negative")
+    if args.kspace_scale <= 0.0:
+        raise ValueError("--kspace-scale must be positive")
+    if args.initial_t < 0.0 or args.initial_t > 1.0:
+        raise ValueError("--initial-t must be between 0 and 1")
     color_map = (
         COLOR_MAPS[args.color_map]
         if args.color_map is not None
@@ -222,14 +253,43 @@ def main(argv: list[str] | None = None) -> int:
 
     protein = read_protein_cif_with_codes(args.cif_path)
     grid, field = densfn_forward_1(protein)
+    print(f"RMS field value: {(field**2).mean()**0.5}")
     if args.noise_level > 0.0:
         rng = np.random.default_rng(args.seed)
         field = field + rng.normal(0.0, args.noise_level, field.shape).astype(np.float32)
     axis_dim = AXIS_TO_DIM[args.axis]
     initial_slice_i = int(grid.N[axis_dim] // 2)
+    field_tensor = None
+    kspace_noise = None
+    if args.kspace_blur:
+        field_tensor = torch.from_numpy(np.moveaxis(field, -1, 0).copy()).float()
+        generator = torch.Generator(device=field_tensor.device)
+        generator.manual_seed(args.seed)
+        _initial_field, kspace_noise = kspace_blur(
+            lambda kx, ky, kz: nf_1(torch.tensor(0.0), kx, ky, kz, blur_max=args.blur_max),
+            field_tensor,
+            scale=args.kspace_scale,
+            generator=generator,
+            return_noise=True
+        )
 
-    def normalized_image(slice_i: int) -> np.ndarray:
-        density_slice = _density_slice(field, axis_dim, slice_i, args.smoothing)
+    def field_at_t(t: float) -> np.ndarray:
+        if not args.kspace_blur:
+            return field
+        assert field_tensor is not None
+        assert kspace_noise is not None
+        t = torch.as_tensor(t)
+        noised = kspace_blur(
+            lambda kx, ky, kz: nf_1(t, kx, ky, kz, blur_max=args.blur_max),
+            field_tensor,
+            scale=args.kspace_scale,
+            noise=kspace_noise,
+        )
+        noised = noised.detach().cpu().numpy()
+        return np.ascontiguousarray(np.moveaxis(noised, 0, -1).astype(np.float32))
+
+    def normalized_image(slice_i: int, t: float) -> np.ndarray:
+        density_slice = _density_slice(field_at_t(t), axis_dim, slice_i, args.smoothing)
         image = _rgb_image(density_slice, color_map)
         image = np.clip(image, 0.0, 1.0)
         return np.swapaxes(image, 0, 1)
@@ -243,10 +303,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.color_map is not None
         else "RGB=" + ", ".join(DENSFN_FORWARD_1_CHANNELS[i] for i in args.channels)
     )
+    state = {"slice_i": initial_slice_i, "t": args.initial_t}
     fig, ax = plt.subplots()
-    plt.subplots_adjust(bottom=0.18)
+    plt.subplots_adjust(bottom=0.27 if args.kspace_blur else 0.18)
     image_artist = ax.imshow(
-        normalized_image(initial_slice_i),
+        normalized_image(state["slice_i"], state["t"]),
         origin="lower",
         interpolation="nearest",
     )
@@ -254,22 +315,33 @@ def main(argv: list[str] | None = None) -> int:
     ax.set_xlabel(f"grid {shown_axes[0]}")
     ax.set_ylabel(f"grid {shown_axes[1]}")
 
-    def set_title(slice_i: int) -> None:
+    def set_title() -> None:
+        blur_desc = ""
+        if args.kspace_blur:
+            blur_desc = f" | t={state['t']:.3f} | blur_max={args.blur_max:g}"
         ax.set_title(
-            f"{args.cif_path} | {args.axis}={slice_i} | "
-            f"smoothing={args.smoothing:g} | noise={args.noise_level:g} | {color_desc}"
+            f"{args.cif_path} | {args.axis}={state['slice_i']} | "
+            f"smoothing={args.smoothing:g} | noise={args.noise_level:g}"
+            f"{blur_desc} | {color_desc}"
         )
 
-    def update_slice(value: float) -> None:
-        slice_i = int(round(value))
-        image_artist.set_data(normalized_image(slice_i))
-        set_title(slice_i)
+    def update_image() -> None:
+        image_artist.set_data(normalized_image(state["slice_i"], state["t"]))
+        set_title()
         fig.canvas.draw_idle()
 
-    set_title(initial_slice_i)
-    slider_ax = fig.add_axes([0.15, 0.06, 0.7, 0.03])
+    def update_slice(value: float) -> None:
+        state["slice_i"] = int(round(value))
+        update_image()
+
+    def update_t(value: float) -> None:
+        state["t"] = float(value)
+        update_image()
+
+    set_title()
+    slice_slider_ax = fig.add_axes([0.15, 0.13 if args.kspace_blur else 0.06, 0.7, 0.03])
     slice_slider = Slider(
-        slider_ax,
+        slice_slider_ax,
         f"{args.axis} slice",
         0,
         int(grid.N[axis_dim] - 1),
@@ -277,6 +349,10 @@ def main(argv: list[str] | None = None) -> int:
         valstep=1,
     )
     slice_slider.on_changed(update_slice)
+    if args.kspace_blur:
+        t_slider_ax = fig.add_axes([0.15, 0.06, 0.7, 0.03])
+        t_slider = Slider(t_slider_ax, "t", 0.0, 1.0, valinit=args.initial_t)
+        t_slider.on_changed(update_t)
     plt.show()
     return 0
 
