@@ -5,14 +5,14 @@ import torch
 from torch import nn
 
 from umup_layers.residual_layers import (
-  get_param_groups, scale_param_lrs, UMUPConv3d, UMUPTanhGated, UMUPResiduals)
+  get_param_groups, scale_param_lrs, UMUPConv3d, rms_norm_3d_no_affine, UMUPResiduals, embed_t)
 from util import must_be, annotate_path
 from source_save import get_current_source, source_dict_diff
 from big_convs_3d import gaussian_blur_3d
 
 
 CIF_DATASET_PATH = "cath-cif"
-SAVE_PATH = "models/flownet_6.pt"
+SAVE_PATH = "models/flownet_7.pt"
 
 
 @dataclass
@@ -47,6 +47,39 @@ def avgpool_8(x):
   kernel = 0.125 + torch.zeros(1, 1, 2, 2, 2, device=x.device)
   return torch.nn.functional.conv3d(x, kernel, stride=(2, 2, 2))
 
+class PlusConv3d(nn.Module):
+  def __init__(self, chan_in:int, chan_out:int):
+    super().__init__()
+    self.conv_x = UMUPConv3d(chan_in, chan_out, (3, 1, 1), (1, 0, 0))
+    self.conv_y = UMUPConv3d(chan_in, chan_out, (1, 3, 1), (0, 1, 0))
+    self.conv_z = UMUPConv3d(chan_in, chan_out, (1, 1, 3), (0, 0, 1))
+  def forward(self, x, with_bias=None):
+    return self.conv_x(x, with_bias=with_bias) + self.conv_y(x) + self.conv_z(x)
+
+class UMUPTanhGatedPlus(nn.Module):
+  def __init__(self, chan_res:int, chan_gate:int|None=None, alpha_tanh:float=1.6, t_depend:bool=False):
+    super().__init__()
+    if chan_gate is None:
+      chan_gate = chan_res
+    self.alpha_tanh = alpha_tanh
+    self.t_depend = t_depend
+    self.tanh_offsets = nn.Parameter(torch.empty(chan_gate))
+    nn.init.zeros_(self.tanh_offsets)
+    self.conv1 = PlusConv3d(chan_res, chan_gate)
+    self.conv2 = PlusConv3d(chan_res, chan_gate)
+    self.conv3 = UMUPConv3d(chan_gate, chan_res, (1, 1, 1), (0, 0, 0))
+    if self.t_depend:
+      self.t_emb = UMUPConv3d(16,     chan_gate, (1, 1, 1), (0, 0, 0))
+  def forward(self, x, t=None):
+    # pre-norm
+    x = rms_norm_3d_no_affine(x)
+    # convolutions
+    conv = self.conv1(x)
+    gate = torch.tanh(self.conv2(x, with_bias=self.tanh_offsets))*self.alpha_tanh
+    if self.t_depend:
+      gate = gate*(12/13) + self.t_emb(embed_t(t))*(5/13)
+    return self.conv3(conv*gate)
+
 class UNet3d(nn.Module):
   def __init__(self, conf:FlowConfig):
     super().__init__()
@@ -54,7 +87,7 @@ class UNet3d(nn.Module):
     chan_0 = conf.chan_L_list[0][0]
     self.readin = LinearReadinWithBias(conf.chan_dens, chan_0)
     self.input_residuals = nn.ModuleList([
-      UMUPResiduals(L, lambda j: UMUPTanhGated(chan, t_depend=True))
+      UMUPResiduals(L, lambda j: UMUPTanhGatedPlus(chan, t_depend=True))
       for chan, L in conf.chan_L_list
     ])
     self.compressors = nn.ModuleList([
@@ -66,7 +99,7 @@ class UNet3d(nn.Module):
       for (chan1, L1), (chan2, L2) in zip(conf.chan_L_list[:-1], conf.chan_L_list[1:])
     ])
     self.output_residuals = nn.ModuleList([
-      UMUPResiduals(L, lambda j: UMUPTanhGated(chan, t_depend=True))
+      UMUPResiduals(L, lambda j: UMUPTanhGatedPlus(chan, t_depend=True))
       for chan, L in conf.chan_L_list
     ])
     self.readout = UMUPConv3d(chan_0, conf.chan_dens, (1, 1, 1), (0, 0, 0), readout=True)
