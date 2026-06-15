@@ -12,7 +12,7 @@ from big_convs_3d import gaussian_blur_3d
 
 
 CIF_DATASET_PATH = "cath-cif"
-SAVE_PATH = "models/flownet_4.pt"
+SAVE_PATH = "models/flownet_6.pt"
 
 
 @dataclass
@@ -21,7 +21,8 @@ class FlowConfig:
   chan_dens:int
   chan_L_list:list[tuple[int, int]]
   blur_list:list[float]
-  lr:float = 0.1
+  lr:float = 0.05
+  intensity_ratio:float = 20.
   autocast:bool = False
   
 
@@ -140,6 +141,7 @@ class FlowModel:
     gx, gy, gz = x.shape[-3:]
     crop_x, crop_y, crop_z = max(1, (gx - 48)//2), max(1, (gy - 48)//2), max(1, (gz - 48)//2)
     x = x[..., crop_x:-crop_x, crop_y:-crop_y, crop_z:-crop_z]
+    x = x*self.conf.intensity_ratio
     ε = torch.randn_like(x)
     t = torch.rand(x.shape[0], 1, 1, 1, 1, device=x.device).expand(-1, 1, *x.shape[-3:])
     with torch.autocast(device_type=x.device.type, enabled=False):
@@ -166,13 +168,13 @@ class FlowModel:
     self.model.eval()
     batch, must_be[self.conf.chan_dens], gx, gy, gz = ε.shape
     for i in range(steps):
-      t_value = 1.0 - (0.5 + i)/steps
-      t_batch = t_value + torch.zeros(batch, device=ε.device)
-      t = t[:, None, None, None, None]
+      t_value = (0.5 + i)/steps
+      t = t_value + torch.zeros(batch, device=ε.device)
+      t = t[:, None, None, None, None].expand(-1, 1, *ε.shape[-3:])
       with torch.autocast(device_type=ε.device.type, dtype=torch.bfloat16, enabled=self.conf.autocast):
         v = self.model(ε, t)
-      ε = ε - v*(1/steps)
-    return ε
+      ε = ε + v*(1/steps)
+    return ε/self.conf.intensity_ratio
 
 
 if __name__ == "__main__":
