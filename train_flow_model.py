@@ -4,15 +4,15 @@ import json
 import torch
 from torch import nn
 
-from umup_layers.residual_layers import (
+from umup_layers.residual_layers import ( LrScale,
   get_param_groups, scale_param_lrs, UMUPConv3d, rms_norm_3d_no_affine, UMUPResiduals, embed_t)
 from util import must_be, annotate_path
 from source_save import get_current_source, source_dict_diff
-from big_convs_3d import gaussian_blur_3d
+from big_convs_3d import gaussian_blur_3d, affine_gauss_conv_3d
 
 
 CIF_DATASET_PATH = "cath-cif"
-SAVE_PATH = "models/flownet_7.pt"
+SAVE_PATH = "models/flownet_8.pt"
 
 
 @dataclass
@@ -53,8 +53,22 @@ class PlusConv3d(nn.Module):
     self.conv_x = UMUPConv3d(chan_in, chan_out, (3, 1, 1), (1, 0, 0))
     self.conv_y = UMUPConv3d(chan_in, chan_out, (1, 3, 1), (0, 1, 0))
     self.conv_z = UMUPConv3d(chan_in, chan_out, (1, 1, 3), (0, 0, 1))
+    self.conv_blur = BlurConv3d(chan_in, [2. + 10.*j/chan_out for j in range(chan_out)])
   def forward(self, x, with_bias=None):
-    return self.conv_x(x, with_bias=with_bias) + self.conv_y(x) + self.conv_z(x)
+    return self.conv_x(x, with_bias=with_bias) + self.conv_y(x) + self.conv_z(x) + self.conv_blur(x)
+
+class BlurConv3d(nn.Module):
+  def __init__(self, chan_in:int, sigmas:list[float]):
+    super().__init__()
+    chan_out = len(sigmas)
+    self.weight = nn.Parameter(torch.randn(4, chan_out, chan_in))
+    self.sigmas = nn.parameter.Buffer(torch.tensor(sigmas))
+    self.lr_scale = LrScale(4*chan_in)
+    self.scale = (4*chan_in)**-0.5
+  def parameters_with_lr_scalings(self):
+    return [(self.lr_scale, self.weight)]
+  def forward(self, x):
+    return self.scale*affine_gauss_conv_3d(x, self.sigmas, self.weight)
 
 class UMUPTanhGatedPlus(nn.Module):
   def __init__(self, chan_res:int, chan_gate:int|None=None, alpha_tanh:float=1.6, t_depend:bool=False):
@@ -212,7 +226,7 @@ class FlowModel:
 
 if __name__ == "__main__":
   from density_dataset import CHAN_DENSFN_1, make_density_batch_loader
-  batch = 2
+  batch = 1
   chan_L_list = [(64, 5), (128, 5), (256, 5), (512, 4)]
   autocast = True
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

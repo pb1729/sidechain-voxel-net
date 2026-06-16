@@ -34,7 +34,7 @@ def _gaussian_kernel_1d(
   if use_rms_norm:
     kernel = kernel*torch.rsqrt(kernel.square().sum(-1, keepdim=True))
   else:
-    kernel = kernel/kernel.sum(-1, keepdim=True)
+    kernel = kernel/abs(kernel).sum(-1, keepdim=True)
   return kernel.to(dtype=dtype)
 
 
@@ -54,8 +54,8 @@ def affine_gauss_conv_3d(
   must_be[4], must_be[chan_out], must_be[chan_in] = W.shape
   sigma_max = torch.max(sigma)
   radius = int(round(4*sigma_max.item()))
-  blur_1 = _gaussian_kernel_1d(sigma, radius, use_rms_norm=True)
-  blur_v = _gaussian_kernel_1d(sigma, radius, poly=(0., 1.), use_rms_norm=True)
+  blur_1 = _gaussian_kernel_1d(sigma, radius)
+  blur_v = _gaussian_kernel_1d(sigma, radius, poly=(0., 1.))
   blur_x = torch.concatenate([blur_1, blur_v, blur_1, blur_1], dim=0)[:, None, :, None, None]
   blur_y = torch.concatenate([blur_1, blur_1, blur_v, blur_1], dim=0)[:, None, None, :, None]
   blur_z = torch.concatenate([blur_1, blur_1, blur_1, blur_v], dim=0)[:, None, None, None, :]
