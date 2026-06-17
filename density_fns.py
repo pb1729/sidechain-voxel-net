@@ -35,6 +35,128 @@ DENSFN_FORWARD_1_CHANNELS = (
 DENSFN_FORWARD_1_CHANNEL_INDEX = {
   channel: i for i, channel in enumerate(DENSFN_FORWARD_1_CHANNELS)
 }
+DENSFN_FORWARD_2_CHANNELS = (
+  "backbone_ca",
+  "backbone_c",
+  "backbone_n",
+  "backbone_o",
+  "sidechain_n",
+  "sidechain_o",
+  "sidechain_s",
+  "sidechain_c_grey",
+  "sidechain_c_blue",
+)
+DENSFN_FORWARD_2_CHANNEL_INDEX = {
+  channel: i for i, channel in enumerate(DENSFN_FORWARD_2_CHANNELS)
+}
+DENSFN_FORWARD_2_CHANNELS_IN_FORWARD_1 = tuple(
+  DENSFN_FORWARD_1_CHANNEL_INDEX[channel]
+  for channel in DENSFN_FORWARD_2_CHANNELS
+)
+
+
+@dataclass(frozen=True)
+class DensFn1:
+  def channel_count(self) -> int:
+    return len(DENSFN_FORWARD_1_CHANNELS)
+
+  def forward(
+      self,
+      protein: ProteinWithCodes,
+      *,
+      grid: "Grid | None" = None,
+      dx: float = 1.0,
+      padding: float = 2.0,
+      rng: np.random.Generator | None = None,
+  ) -> tuple["Grid", NPArr(np.float32, "Nx", "Ny", "Nz", "chan")]:
+    return densfn_forward_1(
+      protein,
+      grid=grid,
+      dx=dx,
+      padding=padding,
+      rng=rng,
+    )
+
+  def backward(
+      self,
+      grid: "Grid",
+      field: NPArr(np.float32, "Nx", "Ny", "Nz", "chan"),
+      *,
+      peak_threshold: float = 0.55,
+  ) -> ProteinWithCodes:
+    return densfn_backward_1(grid, field, peak_threshold=peak_threshold)
+
+
+@dataclass(frozen=True)
+class DensFn2:
+  stride: int = 4
+  atom_gaussian_radius: float = 1.0
+  atom_gaussian_sigma: float | None = None
+  output_channels: int = 32
+  seed: int = 0
+  random_conv_radius: float = 4.0
+  device: str | torch.device | None = None
+  conv_method: Literal["direct", "fft"] = "fft"
+  fft_phase_batch_size: int | None = 8
+
+  def channel_count(self) -> int:
+    return self.output_channels
+
+  def forward(
+      self,
+      protein: ProteinWithCodes,
+      *,
+      grid: "Grid | None" = None,
+      dx: float = 1.0,
+      padding: float = 2.0,
+      rng: np.random.Generator | None = None,
+  ) -> tuple["Grid", NPArr(np.float32, "Nx", "Ny", "Nz", "output_channels")]:
+    return densfn_forward_2(
+      protein,
+      grid=grid,
+      dx=dx,
+      padding=padding,
+      rng=rng,
+      stride=self.stride,
+      atom_gaussian_radius=self.atom_gaussian_radius,
+      atom_gaussian_sigma=self.atom_gaussian_sigma,
+      output_channels=self.output_channels,
+      seed=self.seed,
+      random_conv_radius=self.random_conv_radius,
+      device=self.device,
+      conv_method=self.conv_method,
+      fft_phase_batch_size=self.fft_phase_batch_size,
+    )
+
+  def backward(
+      self,
+      grid: "Grid",
+      field: NPArr(np.float32, "Nx", "Ny", "Nz", "output_channels"),
+      *,
+      peak_rel_threshold: float = 0.25,
+      peak_abs_threshold: float | None = None,
+      peak_min_distance: float = 0.7,
+      max_peaks_per_channel: int = 512,
+  ) -> ProteinWithCodes:
+    return densfn_backward_2(
+      grid,
+      field,
+      stride=self.stride,
+      atom_gaussian_radius=self.atom_gaussian_radius,
+      atom_gaussian_sigma=self.atom_gaussian_sigma,
+      seed=self.seed,
+      random_conv_radius=self.random_conv_radius,
+      device=self.device,
+      conv_method=self.conv_method,
+      fft_phase_batch_size=self.fft_phase_batch_size,
+      peak_rel_threshold=peak_rel_threshold,
+      peak_abs_threshold=peak_abs_threshold,
+      peak_min_distance=peak_min_distance,
+      max_peaks_per_channel=max_peaks_per_channel,
+    )
+
+
+DensityFunction = DensFn1 | DensFn2
 
 
 GREY_CARBON = "grey"
@@ -551,6 +673,347 @@ def random_radial_conv_kernel_3d(
   return kernel
 
 
+def _as_3_int_tuple(value, name: str):
+  if isinstance(value, tuple):
+    if len(value) != 3:
+      raise ValueError(f"{name} must be an int or length-3 tuple")
+    return tuple(int(v) for v in value)
+  return (int(value), int(value), int(value))
+
+
+def _fft_conv3d_full(input_tensor: torch.Tensor, kernel_tensor: torch.Tensor) -> torch.Tensor:
+  """Full linear 3D convolution summed over input channels."""
+  batch, chan_in, gx, gy, gz = input_tensor.shape
+  chan_out, must_be[chan_in], kx, ky, kz = kernel_tensor.shape
+  fft_shape = (gx + kx - 1, gy + ky - 1, gz + kz - 1)
+
+  input_fft = torch.fft.rfftn(input_tensor, s=fft_shape, dim=(-3, -2, -1))
+  kernel_fft = torch.fft.rfftn(kernel_tensor, s=fft_shape, dim=(-3, -2, -1))
+  output_fft = (
+    input_fft[:, None, :, :, :, :] * kernel_fft[None, :, :, :, :, :]
+  ).sum(dim=2)
+  return torch.fft.irfftn(output_fft, s=fft_shape, dim=(-3, -2, -1))
+
+
+def _fft_conv3d_full_batched_phases(
+    input_phases: list[torch.Tensor],
+    kernel_phases: list[torch.Tensor],
+) -> list[torch.Tensor]:
+  """Full linear 3D convolutions for matched input/kernel phase pairs."""
+  if len(input_phases) != len(kernel_phases):
+    raise ValueError("input_phases and kernel_phases must have the same length")
+  if not input_phases:
+    return []
+
+  batch, chan_in = input_phases[0].shape[:2]
+  chan_out, must_be[chan_in] = kernel_phases[0].shape[:2]
+  input_shapes = [phase.shape[-3:] for phase in input_phases]
+  kernel_shapes = [phase.shape[-3:] for phase in kernel_phases]
+  fft_shape = tuple(
+    max(input_shape[axis] + kernel_shape[axis] - 1
+        for input_shape, kernel_shape in zip(input_shapes, kernel_shapes))
+    for axis in range(3)
+  )
+
+  input_stack = torch.zeros(
+    (len(input_phases), batch, chan_in, *fft_shape),
+    dtype=input_phases[0].dtype,
+    device=input_phases[0].device,
+  )
+  kernel_stack = torch.zeros(
+    (len(kernel_phases), chan_out, chan_in, *fft_shape),
+    dtype=kernel_phases[0].dtype,
+    device=kernel_phases[0].device,
+  )
+  for phase_i, input_phase in enumerate(input_phases):
+    input_stack[
+      phase_i,
+      :,
+      :,
+      :input_phase.shape[-3],
+      :input_phase.shape[-2],
+      :input_phase.shape[-1],
+    ] = input_phase
+  for phase_i, kernel_phase in enumerate(kernel_phases):
+    kernel_stack[
+      phase_i,
+      :,
+      :,
+      :kernel_phase.shape[-3],
+      :kernel_phase.shape[-2],
+      :kernel_phase.shape[-1],
+    ] = kernel_phase
+
+  input_fft = torch.fft.rfftn(input_stack, dim=(-3, -2, -1))
+  kernel_fft = torch.fft.rfftn(kernel_stack, dim=(-3, -2, -1))
+  output_fft = (
+    input_fft[:, :, None, :, :, :, :] * kernel_fft[:, None, :, :, :, :, :]
+  ).sum(dim=3)
+  full_stack = torch.fft.irfftn(output_fft, s=fft_shape, dim=(-3, -2, -1))
+
+  return [
+    full_stack[
+      phase_i,
+      :,
+      :,
+      :input_shapes[phase_i][0] + kernel_shapes[phase_i][0] - 1,
+      :input_shapes[phase_i][1] + kernel_shapes[phase_i][1] - 1,
+      :input_shapes[phase_i][2] + kernel_shapes[phase_i][2] - 1,
+    ]
+    for phase_i in range(len(input_phases))
+  ]
+
+
+def conv3d_strided_fft_polyphase(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    padding: int | tuple[int, int, int],
+    stride: int | tuple[int, int, int],
+    phase_batch_size: int | None = None,
+) -> torch.Tensor:
+  """Compute ``F.conv3d(input_tensor, weight, padding=padding, stride=stride)``.
+
+  This uses a polyphase decomposition so striding is handled before the FFT
+  convolutions. It is intended for large, non-separable kernels on CPU.
+  """
+  if input_tensor.ndim != 5:
+    raise ValueError(f"input_tensor must have shape (batch, chan, x, y, z), got {input_tensor.shape}")
+  if weight.ndim != 5:
+    raise ValueError(f"weight must have shape (chan_out, chan_in, kx, ky, kz), got {weight.shape}")
+  batch, chan_in, gx, gy, gz = input_tensor.shape
+  chan_out, must_be[chan_in], kx, ky, kz = weight.shape
+  padding = _as_3_int_tuple(padding, "padding")
+  stride = _as_3_int_tuple(stride, "stride")
+  if any(s <= 0 for s in stride):
+    raise ValueError(f"stride values must be positive, got {stride}")
+  if any(p < 0 for p in padding):
+    raise ValueError(f"padding values must be non-negative, got {padding}")
+  if phase_batch_size is not None and phase_batch_size <= 0:
+    raise ValueError("phase_batch_size must be positive if specified")
+
+  output_shape = tuple(
+    (spatial + 2 * pad - kernel) // step + 1
+    for spatial, pad, kernel, step in zip((gx, gy, gz), padding, (kx, ky, kz), stride)
+  )
+  if any(size <= 0 for size in output_shape):
+    raise ValueError(f"conv output shape must be positive, got {output_shape}")
+  output = torch.zeros(
+    (batch, chan_out, *output_shape),
+    dtype=input_tensor.dtype,
+    device=input_tensor.device,
+  )
+
+  phase_records = []
+  kernel_sizes = (kx, ky, kz)
+  for phase_x in range(stride[0]):
+    for phase_y in range(stride[1]):
+      for phase_z in range(stride[2]):
+        phases = (phase_x, phase_y, phase_z)
+        input_phase = input_tensor[
+          :,
+          :,
+          phase_x::stride[0],
+          phase_y::stride[1],
+          phase_z::stride[2],
+        ]
+        kernel_indices_by_axis = []
+        offset_ranges = []
+        for axis, (kernel_size, pad, step, phase) in enumerate(zip(kernel_sizes, padding, stride, phases)):
+          kernel_indices = [
+            kernel_i
+            for kernel_i in range(kernel_size)
+            if (kernel_i - pad) % step == phase
+          ]
+          if not kernel_indices:
+            break
+          offsets = np.asarray(
+            [(kernel_i - pad - phase) // step for kernel_i in kernel_indices],
+            dtype=np.int32,
+          )
+          kernel_indices_by_axis.append(kernel_indices)
+          offset_ranges.append((int(offsets.min()), int(offsets.max())))
+        else:
+          phase_weight = weight[
+            :,
+            :,
+            kernel_indices_by_axis[0],
+            :,
+            :,
+          ][:, :, :, kernel_indices_by_axis[1], :][:, :, :, :, kernel_indices_by_axis[2]]
+          # The strided correlation phase is y[n] = sum_a k[a] x[n + a].
+          # Reverse offsets to express it as a linear convolution.
+          conv_kernel = torch.flip(phase_weight, dims=(-3, -2, -1))
+          crop_start = tuple(offset_range[1] for offset_range in offset_ranges)
+          phase_records.append((input_phase, conv_kernel, crop_start))
+
+  if phase_batch_size is None:
+    phase_batch_size = max(1, len(phase_records))
+  for chunk_start in range(0, len(phase_records), phase_batch_size):
+    chunk = phase_records[chunk_start:chunk_start + phase_batch_size]
+    full_phases = _fft_conv3d_full_batched_phases(
+      [record[0] for record in chunk],
+      [record[1] for record in chunk],
+    )
+    for (_input_phase, _conv_kernel, crop_start), full in zip(chunk, full_phases):
+      source_slices = []
+      dest_slices = []
+      for axis in range(3):
+        source_start = max(crop_start[axis], 0)
+        source_stop = min(crop_start[axis] + output_shape[axis], full.shape[2 + axis])
+        if source_start >= source_stop:
+          break
+        dest_start = source_start - crop_start[axis]
+        dest_stop = dest_start + (source_stop - source_start)
+        source_slices.append(slice(source_start, source_stop))
+        dest_slices.append(slice(dest_start, dest_stop))
+      else:
+        output[
+          :,
+          :,
+          dest_slices[0],
+          dest_slices[1],
+          dest_slices[2],
+        ] += full[
+          :,
+          :,
+          source_slices[0],
+          source_slices[1],
+          source_slices[2],
+        ]
+
+  return output
+
+
+def conv_transpose3d_strided_fft_polyphase(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    padding: int | tuple[int, int, int],
+    stride: int | tuple[int, int, int],
+    output_padding: int | tuple[int, int, int] = 0,
+    phase_batch_size: int | None = None,
+) -> torch.Tensor:
+  """Compute ``F.conv_transpose3d`` for the densfn2 strided-conv geometry."""
+  if input_tensor.ndim != 5:
+    raise ValueError(f"input_tensor must have shape (batch, chan, x, y, z), got {input_tensor.shape}")
+  if weight.ndim != 5:
+    raise ValueError(f"weight must have shape (chan_in, chan_out, kx, ky, kz), got {weight.shape}")
+  batch, chan_in, gx, gy, gz = input_tensor.shape
+  must_be[chan_in], chan_out, kx, ky, kz = weight.shape
+  padding = _as_3_int_tuple(padding, "padding")
+  stride = _as_3_int_tuple(stride, "stride")
+  output_padding = _as_3_int_tuple(output_padding, "output_padding")
+  if any(s <= 0 for s in stride):
+    raise ValueError(f"stride values must be positive, got {stride}")
+  if any(p < 0 for p in padding):
+    raise ValueError(f"padding values must be non-negative, got {padding}")
+  if any(op < 0 or op >= s for op, s in zip(output_padding, stride)):
+    raise ValueError(f"output_padding must satisfy 0 <= output_padding < stride, got {output_padding}")
+  if phase_batch_size is not None and phase_batch_size <= 0:
+    raise ValueError("phase_batch_size must be positive if specified")
+
+  output_shape = tuple(
+    (spatial - 1) * step - 2 * pad + kernel + op
+    for spatial, step, pad, kernel, op in zip((gx, gy, gz), stride, padding, (kx, ky, kz), output_padding)
+  )
+  if any(size <= 0 for size in output_shape):
+    raise ValueError(f"conv_transpose output shape must be positive, got {output_shape}")
+  output = torch.zeros(
+    (batch, chan_out, *output_shape),
+    dtype=input_tensor.dtype,
+    device=input_tensor.device,
+  )
+
+  phase_records = []
+  kernel_sizes = (kx, ky, kz)
+  for phase_x in range(stride[0]):
+    for phase_y in range(stride[1]):
+      for phase_z in range(stride[2]):
+        phases = (phase_x, phase_y, phase_z)
+        kernel_indices_by_axis = []
+        output_offsets = []
+        for kernel_size, pad, step, phase in zip(kernel_sizes, padding, stride, phases):
+          kernel_indices = [
+            kernel_i
+            for kernel_i in range(kernel_size)
+            if (kernel_i - pad) % step == phase
+          ]
+          if not kernel_indices:
+            break
+          offsets = np.asarray(
+            [(kernel_i - pad - phase) // step for kernel_i in kernel_indices],
+            dtype=np.int32,
+          )
+          kernel_indices_by_axis.append(kernel_indices)
+          output_offsets.append((int(offsets.min()), int(offsets.max())))
+        else:
+          phase_weight = weight[
+            :,
+            :,
+            kernel_indices_by_axis[0],
+            :,
+            :,
+          ][:, :, :, kernel_indices_by_axis[1], :][:, :, :, :, kernel_indices_by_axis[2]]
+          # Convert transposed-correlation phase accumulation into linear conv.
+          conv_kernel = phase_weight.permute(1, 0, 2, 3, 4)
+          output_phase_shape = tuple(
+            (output_shape[axis] + stride[axis] - 1 - phases[axis]) // stride[axis]
+            for axis in range(3)
+          )
+          crop_start = tuple(-offset_range[0] for offset_range in output_offsets)
+          phase_records.append((conv_kernel, crop_start, phases, output_phase_shape))
+
+  if phase_batch_size is None:
+    phase_batch_size = max(1, len(phase_records))
+  for chunk_start in range(0, len(phase_records), phase_batch_size):
+    chunk = phase_records[chunk_start:chunk_start + phase_batch_size]
+    full_phases = _fft_conv3d_full_batched_phases(
+      [input_tensor for _record in chunk],
+      [record[0] for record in chunk],
+    )
+    for (_conv_kernel, crop_start, phases, output_phase_shape), full in zip(chunk, full_phases):
+      phase_output = torch.zeros(
+        (batch, chan_out, *output_phase_shape),
+        dtype=input_tensor.dtype,
+        device=input_tensor.device,
+      )
+      source_slices = []
+      dest_slices = []
+      for axis in range(3):
+        source_start = max(crop_start[axis], 0)
+        source_stop = min(crop_start[axis] + output_phase_shape[axis], full.shape[2 + axis])
+        if source_start >= source_stop:
+          break
+        dest_start = source_start - crop_start[axis]
+        dest_stop = dest_start + (source_stop - source_start)
+        source_slices.append(slice(source_start, source_stop))
+        dest_slices.append(slice(dest_start, dest_stop))
+      else:
+        phase_output[
+          :,
+          :,
+          dest_slices[0],
+          dest_slices[1],
+          dest_slices[2],
+        ] = full[
+          :,
+          :,
+          source_slices[0],
+          source_slices[1],
+          source_slices[2],
+        ]
+        output[
+          :,
+          :,
+          phases[0]::stride[0],
+          phases[1]::stride[1],
+          phases[2]::stride[2],
+        ] += phase_output
+
+  return output
+
+
 def densfn_forward_2(
     protein: ProteinWithCodes,
     *,
@@ -565,6 +1028,8 @@ def densfn_forward_2(
     seed: int = 0,
     random_conv_radius: float = 4.0,
     device: str | torch.device | None = None,
+    conv_method: Literal["direct", "fft"] = "direct",
+    fft_phase_batch_size: int | None = 8,
 ) -> tuple[Grid, NPArr(np.float32, "Nx", "Ny", "Nz", "output_channels")]:
   """Map a protein to a fine Gaussian density followed by random strided conv.
 
@@ -584,20 +1049,23 @@ def densfn_forward_2(
     N=(np.asarray(grid.N, dtype=np.int32) * stride).astype(np.int32),
     transform=grid.transform,
   )
-  fine_field = density_field(fine_grid, len(DENSFN_FORWARD_1_CHANNELS))
+  fine_field = density_field(fine_grid, len(DENSFN_FORWARD_2_CHANNELS))
   density_positions, density_vectors = _densfn_forward_1_samples(protein)
   if density_positions:
+    density_vectors = np.asarray(density_vectors, dtype=np.float32)
+    density_vectors = density_vectors[:, DENSFN_FORWARD_2_CHANNELS_IN_FORWARD_1]
+    atom_sample_mask = np.any(density_vectors != 0.0, axis=1)
     add_gaussian_atom_densities(
       fine_field,
       fine_grid,
-      np.asarray(density_positions, dtype=np.float32),
-      np.asarray(density_vectors, dtype=np.float32),
+      np.asarray(density_positions, dtype=np.float32)[atom_sample_mask],
+      density_vectors[atom_sample_mask],
       radius=atom_gaussian_radius,
       sigma=atom_gaussian_sigma,
     )
 
   kernel = random_radial_conv_kernel_3d(
-    len(DENSFN_FORWARD_1_CHANNELS),
+    len(DENSFN_FORWARD_2_CHANNELS),
     output_channels,
     dx=fine_grid.dx,
     radius=random_conv_radius,
@@ -613,12 +1081,23 @@ def densfn_forward_2(
   kernel_tensor = torch.from_numpy(kernel).to(conv_device)
   radius_grid = kernel.shape[-1] // 2
   with torch.no_grad():
-    output = F.conv3d(
-      fine_tensor,
-      kernel_tensor,
-      padding=radius_grid,
-      stride=stride,
-    )
+    if conv_method == "direct":
+      output = F.conv3d(
+        fine_tensor,
+        kernel_tensor,
+        padding=radius_grid,
+        stride=stride,
+      )
+    elif conv_method == "fft":
+      output = conv3d_strided_fft_polyphase(
+        fine_tensor,
+        kernel_tensor,
+        padding=radius_grid,
+        stride=stride,
+        phase_batch_size=fft_phase_batch_size,
+      )
+    else:
+      raise ValueError(f"unknown conv_method {conv_method!r}")
   field = np.moveaxis(output.squeeze(0).cpu().numpy(), 0, -1)
   must_be[(*grid.shape, output_channels)] = field.shape
   return grid, np.ascontiguousarray(field.astype(np.float32))
@@ -681,6 +1160,8 @@ def densfn_backward_2_score_fields(
     seed: int = 0,
     random_conv_radius: float = 4.0,
     device: str | torch.device | None = None,
+    conv_method: Literal["direct", "fft"] = "direct",
+    fft_phase_batch_size: int | None = 8,
 ) -> tuple[Grid, NPArr(np.float32, "Nx_fine", "Ny_fine", "Nz_fine", "chan")]:
   """Map a random-projected density field back to fine semantic score fields."""
   field = np.asarray(field, dtype=np.float32)
@@ -689,7 +1170,7 @@ def densfn_backward_2_score_fields(
   fine_grid = _fine_grid_for_stride(grid, stride)
 
   kernel = random_radial_conv_kernel_3d(
-    len(DENSFN_FORWARD_1_CHANNELS),
+    len(DENSFN_FORWARD_2_CHANNELS),
     output_channels,
     dx=fine_grid.dx,
     radius=random_conv_radius,
@@ -706,14 +1187,26 @@ def densfn_backward_2_score_fields(
   kernel_tensor = torch.from_numpy(kernel).to(conv_device)
   radius_grid = kernel.shape[-1] // 2
   with torch.no_grad():
-    score_tensor = F.conv_transpose3d(
-      field_tensor,
-      kernel_tensor,
-      padding=radius_grid,
-      stride=stride,
-      output_padding=stride - 1,
-    )
-    must_be[(1, len(DENSFN_FORWARD_1_CHANNELS), *fine_grid.shape)] = score_tensor.shape
+    if conv_method == "direct":
+      score_tensor = F.conv_transpose3d(
+        field_tensor,
+        kernel_tensor,
+        padding=radius_grid,
+        stride=stride,
+        output_padding=stride - 1,
+      )
+    elif conv_method == "fft":
+      score_tensor = conv_transpose3d_strided_fft_polyphase(
+        field_tensor,
+        kernel_tensor,
+        padding=radius_grid,
+        stride=stride,
+        output_padding=stride - 1,
+        phase_batch_size=fft_phase_batch_size,
+      )
+    else:
+      raise ValueError(f"unknown conv_method {conv_method!r}")
+    must_be[(1, len(DENSFN_FORWARD_2_CHANNELS), *fine_grid.shape)] = score_tensor.shape
     score_tensor = _gaussian_matched_filter_3d(
       score_tensor,
       fine_grid,
@@ -798,7 +1291,7 @@ def _extract_densfn_forward_2_peaks(
     "sidechain_c_blue",
   )
   for channel in peak_channels:
-    channel_i = DENSFN_FORWARD_1_CHANNEL_INDEX[channel]
+    channel_i = DENSFN_FORWARD_2_CHANNEL_INDEX[channel]
     peaks[channel] = _extract_matched_score_peaks(
       grid,
       score_field[..., channel_i],
@@ -820,6 +1313,8 @@ def densfn_backward_2(
     seed: int = 0,
     random_conv_radius: float = 4.0,
     device: str | torch.device | None = None,
+    conv_method: Literal["direct", "fft"] = "direct",
+    fft_phase_batch_size: int | None = 8,
     peak_rel_threshold: float = 0.25,
     peak_abs_threshold: float | None = None,
     peak_min_distance: float = 0.7,
@@ -835,6 +1330,8 @@ def densfn_backward_2(
     seed=seed,
     random_conv_radius=random_conv_radius,
     device=device,
+    conv_method=conv_method,
+    fft_phase_batch_size=fft_phase_batch_size,
   )
   peaks = _extract_densfn_forward_2_peaks(
     fine_grid,
@@ -847,7 +1344,6 @@ def densfn_backward_2(
   return densfn_peaks_to_protein(
     fine_grid,
     peaks,
-    bond_field=score_field[..., DENSFN_FORWARD_1_CHANNEL_INDEX["backbone_bond"]],
   )
 
 

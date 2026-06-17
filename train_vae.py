@@ -140,8 +140,10 @@ class VAE:
 
 
 if __name__ == "__main__":
-  from density_dataset import CHAN_DENSFN_1, make_density_batch_loader
+  from density_dataset import make_density_batch_loader
+  from density_fns import DensFn1
   batch = 8
+  densfn = DensFn1()
   chan_1 = 64
   chan_2 = 96
   L = 3
@@ -152,13 +154,13 @@ if __name__ == "__main__":
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
   print("device:", device)
   print(SAVE_PATH)
-  conf = VAEConfig(batch, CHAN_DENSFN_1, chan_1, L, chan_2, L, chan_latent, autocast=autocast, sigma_z=sigma_z)
+  conf = VAEConfig(batch, densfn.channel_count(), chan_1, L, chan_2, L, chan_latent, autocast=autocast, sigma_z=sigma_z)
   vae = VAE(conf).to(device)
   i = 0
   for epoch in range(1):
     vae.record(i, "start_epoch", epoch)
     dataloader = make_density_batch_loader(CIF_DATASET_PATH, conf.batch,
-      holdout_percent=holdout_percent, holdout=False)
+      densfn=densfn, holdout_percent=holdout_percent, holdout=False)
     for x in dataloader:
       x = x.to(device)
       vae.step(i, x)

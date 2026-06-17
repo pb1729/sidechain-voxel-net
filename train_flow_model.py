@@ -225,8 +225,10 @@ class FlowModel:
 
 
 if __name__ == "__main__":
-  from density_dataset import CHAN_DENSFN_1, make_density_batch_loader
+  from density_dataset import make_density_batch_loader
+  from density_fns import DensFn1
   batch = 1
+  densfn = DensFn1()
   chan_L_list = [(64, 5), (128, 5), (256, 5), (512, 4)]
   autocast = True
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -234,7 +236,7 @@ if __name__ == "__main__":
   print(SAVE_PATH)
   conf = FlowConfig(
     batch,
-    CHAN_DENSFN_1,
+    densfn.channel_count(),
     chan_L_list,
     [2., 4., 6., 8.],
     autocast=autocast,
@@ -243,7 +245,7 @@ if __name__ == "__main__":
   i = 0
   for epoch in range(40):
     flowmodel.record(i, "start_epoch", epoch)
-    dataloader = make_density_batch_loader(CIF_DATASET_PATH, conf.batch)
+    dataloader = make_density_batch_loader(CIF_DATASET_PATH, conf.batch, densfn=densfn)
     for x in dataloader:
       x = x.to(device)
       flowmodel.step(i, x)
@@ -254,5 +256,4 @@ if __name__ == "__main__":
       i += 1
     torch.save(flowmodel.to_dict(), annotate_path(SAVE_PATH, f"epoch_{epoch}"))
   torch.save(flowmodel.to_dict(), SAVE_PATH)
-
 

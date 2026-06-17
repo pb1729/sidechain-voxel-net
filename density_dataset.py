@@ -10,11 +10,12 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
-from density_fns import DENSFN_FORWARD_1_CHANNELS, densfn_forward_1
+from density_fns import DensFn1, DensityFunction
 from parse_cif import read_protein_cif_with_codes
 
 
-CHAN_DENSFN_1 = len(DENSFN_FORWARD_1_CHANNELS)
+DEFAULT_DENSFN = DensFn1()
+CHAN_DENSFN_1 = DEFAULT_DENSFN.channel_count()
 
 
 def is_holdout(filename: str | Path, holdout_percent: int | float) -> bool:
@@ -43,11 +44,12 @@ def _as_file_list(cif_paths: str | Path | Iterable[str | Path]) -> list[Path]:
 def cif_to_density_tensor(
     cif_path: str | Path,
     *,
+    densfn: DensityFunction = DEFAULT_DENSFN,
     rng: np.random.Generator | None = None,
 ) -> torch.Tensor:
     """Read one CIF and return its density tensor as (chan, H, W, L)."""
     protein = read_protein_cif_with_codes(cif_path)
-    _grid, density = densfn_forward_1(protein, rng=rng)
+    _grid, density = densfn.forward(protein, rng=rng)
     density = np.moveaxis(density, -1, 0)
     return torch.from_numpy(np.ascontiguousarray(density))
 
@@ -86,6 +88,7 @@ def _filter_holdout_files(
 def make_density_batch(
     cif_paths: Iterable[str | Path],
     *,
+    densfn: DensityFunction = DEFAULT_DENSFN,
     rng: np.random.Generator | None = None,
 ) -> torch.Tensor:
     """Convert CIF files to a zero-padded density batch.
@@ -97,7 +100,7 @@ def make_density_batch(
     if rng is None:
         rng = np.random.default_rng()
 
-    tensors = [cif_to_density_tensor(path, rng=rng) for path in cif_paths]
+    tensors = [cif_to_density_tensor(path, densfn=densfn, rng=rng) for path in cif_paths]
     if not tensors:
         raise ValueError("cannot make a batch from zero CIF files")
 
@@ -129,6 +132,7 @@ class CifDensityBatchDataset(IterableDataset):
         batch_size: int,
         *,
         seed: int | None = None,
+        densfn: DensityFunction = DEFAULT_DENSFN,
         drop_last: bool = True,
         holdout_percent: int | float = 0,
         holdout: bool = False,
@@ -138,6 +142,7 @@ class CifDensityBatchDataset(IterableDataset):
         self.files = _filter_holdout_files(_as_file_list(cif_paths), holdout_percent, holdout)
         self.batch_size = int(batch_size)
         self.seed = seed
+        self.densfn = densfn
         self.drop_last = drop_last
 
     def __iter__(self) -> Iterator[torch.Tensor]:
@@ -158,7 +163,7 @@ class CifDensityBatchDataset(IterableDataset):
             if len(batch_files) < self.batch_size and self.drop_last:
                 continue
             try:
-                batch = make_density_batch(batch_files, rng=rng)
+                batch = make_density_batch(batch_files, densfn=self.densfn, rng=rng)
             except: continue
             yield batch
 
@@ -167,6 +172,7 @@ def make_density_batch_loader(
     batch_size: int,
     *,
     seed: int | None = None,
+    densfn: DensityFunction = DEFAULT_DENSFN,
     drop_last: bool = True,
     num_workers: int = 0,
     holdout_percent: int | float = 0,
@@ -177,6 +183,7 @@ def make_density_batch_loader(
         cif_paths,
         batch_size,
         seed=seed,
+        densfn=densfn,
         drop_last=drop_last,
         holdout_percent=holdout_percent,
         holdout=holdout,
