@@ -3,6 +3,8 @@ import itertools
 from typing import Literal
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from util import must_be
 from parse_cif import ATOM_IDENTITY_ELEMENTS, ProteinWithCodes, Z2CoordPair
@@ -180,6 +182,13 @@ class _Peak:
 
 
 @dataclass(frozen=True)
+class DensityCandidate:
+  channel: str
+  coord: NPArr(np.float32, 3)
+  value: float = 1.0
+
+
+@dataclass(frozen=True)
 class _BackboneResidue:
   n: NPArr(np.float32, 3)
   ca: NPArr(np.float32, 3)
@@ -349,19 +358,7 @@ def _chain_end_weight(offset_from_end, count):
   return float(np.linspace(4.0, 0.0, count, dtype=np.float32)[offset_from_end])
 
 
-def densfn_forward_1(
-    protein: ProteinWithCodes,
-    *,
-    grid: Grid | None = None,
-    dx: float = 1.0,
-    padding: float = 2.0,
-    rng: np.random.Generator | None = None,
-) -> tuple[Grid, NPArr(np.float32, "Nx", "Ny", "Nz", "chan")]:
-  """Map a parsed protein to the first density-field representation."""
-  if grid is None:
-    grid = box_with_grid_for_protein(protein, dx=dx, padding=padding, rng=rng)
-  field = density_field(grid, len(DENSFN_FORWARD_1_CHANNELS))
-
+def _densfn_forward_1_samples(protein: ProteinWithCodes):
   density_positions = []
   density_vectors = []
 
@@ -437,6 +434,23 @@ def densfn_forward_1(
         end_weight,
       )
 
+  return density_positions, density_vectors
+
+
+def densfn_forward_1(
+    protein: ProteinWithCodes,
+    *,
+    grid: Grid | None = None,
+    dx: float = 1.0,
+    padding: float = 2.0,
+    rng: np.random.Generator | None = None,
+) -> tuple[Grid, NPArr(np.float32, "Nx", "Ny", "Nz", "chan")]:
+  """Map a parsed protein to the first density-field representation."""
+  if grid is None:
+    grid = box_with_grid_for_protein(protein, dx=dx, padding=padding, rng=rng)
+  field = density_field(grid, len(DENSFN_FORWARD_1_CHANNELS))
+  density_positions, density_vectors = _densfn_forward_1_samples(protein)
+
   if density_positions:
     add_atom_densities(
       field,
@@ -446,6 +460,395 @@ def densfn_forward_1(
     )
 
   return grid, field
+
+
+def add_gaussian_atom_densities(
+    field: NPArr(np.float32, "Nx", "Ny", "Nz", "chan"),
+    grid: Grid,
+    positions: NPArr(np.float32, "natom", 3),
+    vectors: NPArr(np.float32, "natom", "chan"),
+    *,
+    radius: float,
+    sigma: float | None = None,
+) -> NPArr(np.float32, "Nx", "Ny", "Nz", "chan"):
+  """Add truncated Gaussian atom densities to ``field`` in-place."""
+  if radius <= 0.0:
+    raise ValueError("radius must be positive")
+  if sigma is None:
+    sigma = 0.5 * radius
+  if sigma <= 0.0:
+    raise ValueError("sigma must be positive")
+
+  positions = np.asarray(positions, dtype=np.float32)
+  vectors = np.asarray(vectors, dtype=np.float32)
+
+  natom, must_be[3] = positions.shape
+  must_be[natom], chan = vectors.shape
+  must_be[(*grid.shape, chan)] = field.shape
+
+  radius_grid = int(np.ceil(radius / grid.dx))
+  inv_two_sigma2 = 0.5 / (sigma * sigma)
+  for position, vector in zip(positions, vectors):
+    index = coord_to_grid_index(grid, position)
+    center = np.round(index).astype(np.int32)
+    lo = np.maximum(center - radius_grid, 0)
+    hi = np.minimum(center + radius_grid + 1, grid.N)
+    if np.any(lo >= hi):
+      continue
+
+    coords = np.indices(tuple(hi - lo), dtype=np.float32)
+    dist2 = np.zeros(tuple(hi - lo), dtype=np.float32)
+    for axis in range(3):
+      offset_angstrom = (coords[axis] + lo[axis] - index[axis]) * grid.dx
+      dist2 += offset_angstrom * offset_angstrom
+    weights = np.exp(-dist2 * inv_two_sigma2).astype(np.float32)
+    weights[dist2 > radius * radius] = 0.0
+    weight_sum = float(weights.sum())
+    if weight_sum == 0.0:
+      continue
+    weights /= weight_sum
+    field[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2], :] += weights[..., None] * vector
+
+  return field
+
+
+def random_radial_conv_kernel_3d(
+    chan_in: int,
+    chan_out: int,
+    *,
+    dx: float,
+    radius: float,
+    seed: int,
+) -> NPArr(np.float32, "chan_out", "chan_in", "kx", "ky", "kz"):
+  """Create a deterministic random 3D conv kernel with a radial cutoff."""
+  if chan_in <= 0:
+    raise ValueError("chan_in must be positive")
+  if chan_out <= 0:
+    raise ValueError("chan_out must be positive")
+  if dx <= 0.0:
+    raise ValueError("dx must be positive")
+  if radius <= 0.0:
+    raise ValueError("radius must be positive")
+
+  radius_grid = int(np.ceil(radius / dx))
+  offsets = np.arange(-radius_grid, radius_grid + 1, dtype=np.float32) * dx
+  x, y, z = np.meshgrid(offsets, offsets, offsets, indexing="ij")
+  dist = np.sqrt(x * x + y * y + z * z)
+  window_sigma = 0.5 * radius
+  window = np.exp(-0.5 * np.square(dist / window_sigma)).astype(np.float32)
+  window[dist > radius] = 0.0
+
+  rng = np.random.default_rng(seed)
+  kernel = rng.standard_normal(
+    (chan_out, chan_in, *window.shape),
+    dtype=np.float32,
+  )
+  kernel *= window[None, None, :, :, :]
+
+  expected_sq_norm = chan_in * float(np.sum(window * window))
+  if expected_sq_norm > 0.0:
+    kernel *= np.float32(1.0 / np.sqrt(expected_sq_norm))
+  return kernel
+
+
+def densfn_forward_2(
+    protein: ProteinWithCodes,
+    *,
+    grid: Grid | None = None,
+    dx: float = 1.0,
+    padding: float = 2.0,
+    rng: np.random.Generator | None = None,
+    stride: int = 4,
+    atom_gaussian_radius: float = 1.0,
+    atom_gaussian_sigma: float | None = None,
+    output_channels: int = 32,
+    seed: int = 0,
+    random_conv_radius: float = 4.0,
+    device: str | torch.device | None = None,
+) -> tuple[Grid, NPArr(np.float32, "Nx", "Ny", "Nz", "output_channels")]:
+  """Map a protein to a fine Gaussian density followed by random strided conv.
+
+  The returned grid is the coarse output grid. Internally, atoms are sampled on
+  a grid with spacing ``grid.dx / stride`` and then projected back to the coarse
+  spacing by a deterministic random convolution with stride ``stride``.
+  """
+  if stride <= 0:
+    raise ValueError("stride must be positive")
+  if output_channels <= 0:
+    raise ValueError("output_channels must be positive")
+  if grid is None:
+    grid = box_with_grid_for_protein(protein, dx=dx, padding=padding, rng=rng)
+
+  fine_grid = Grid(
+    dx=grid.dx / stride,
+    N=(np.asarray(grid.N, dtype=np.int32) * stride).astype(np.int32),
+    transform=grid.transform,
+  )
+  fine_field = density_field(fine_grid, len(DENSFN_FORWARD_1_CHANNELS))
+  density_positions, density_vectors = _densfn_forward_1_samples(protein)
+  if density_positions:
+    add_gaussian_atom_densities(
+      fine_field,
+      fine_grid,
+      np.asarray(density_positions, dtype=np.float32),
+      np.asarray(density_vectors, dtype=np.float32),
+      radius=atom_gaussian_radius,
+      sigma=atom_gaussian_sigma,
+    )
+
+  kernel = random_radial_conv_kernel_3d(
+    len(DENSFN_FORWARD_1_CHANNELS),
+    output_channels,
+    dx=fine_grid.dx,
+    radius=random_conv_radius,
+    seed=seed,
+  )
+  if device is None:
+    conv_device = torch.device("cpu")
+  else:
+    conv_device = torch.device(device)
+  fine_tensor = torch.from_numpy(
+    np.moveaxis(fine_field, -1, 0)[None, :, :, :, :]
+  ).to(conv_device)
+  kernel_tensor = torch.from_numpy(kernel).to(conv_device)
+  radius_grid = kernel.shape[-1] // 2
+  with torch.no_grad():
+    output = F.conv3d(
+      fine_tensor,
+      kernel_tensor,
+      padding=radius_grid,
+      stride=stride,
+    )
+  field = np.moveaxis(output.squeeze(0).cpu().numpy(), 0, -1)
+  must_be[(*grid.shape, output_channels)] = field.shape
+  return grid, np.ascontiguousarray(field.astype(np.float32))
+
+
+def _fine_grid_for_stride(grid: Grid, stride: int) -> Grid:
+  if stride <= 0:
+    raise ValueError("stride must be positive")
+  return Grid(
+    dx=grid.dx / stride,
+    N=(np.asarray(grid.N, dtype=np.int32) * stride).astype(np.int32),
+    transform=grid.transform,
+  )
+
+
+def _gaussian_matched_filter_3d(
+    score_tensor: torch.Tensor,
+    fine_grid: Grid,
+    *,
+    radius: float,
+    sigma: float | None = None,
+) -> torch.Tensor:
+  if radius <= 0.0:
+    raise ValueError("radius must be positive")
+  if sigma is None:
+    sigma = 0.5 * radius
+  if sigma <= 0.0:
+    raise ValueError("sigma must be positive")
+
+  _batch, chan, _gx, _gy, _gz = score_tensor.shape
+  radius_grid = int(np.ceil(radius / fine_grid.dx))
+  offsets = (
+    torch.arange(
+      -radius_grid,
+      radius_grid + 1,
+      dtype=score_tensor.dtype,
+      device=score_tensor.device,
+    ) * fine_grid.dx
+  )
+  x, y, z = torch.meshgrid(offsets, offsets, offsets, indexing="ij")
+  dist2 = x * x + y * y + z * z
+  weights = torch.exp(-0.5 * dist2 / (sigma * sigma))
+  weights = torch.where(
+    dist2 <= radius * radius,
+    weights,
+    torch.zeros((), dtype=weights.dtype, device=weights.device),
+  )
+  weights = weights / weights.sum()
+  kernel = weights.reshape(1, 1, *weights.shape).expand(chan, 1, -1, -1, -1)
+  return F.conv3d(score_tensor, kernel, padding=radius_grid, groups=chan)
+
+
+def densfn_backward_2_score_fields(
+    grid: Grid,
+    field: NPArr(np.float32, "Nx", "Ny", "Nz", "output_channels"),
+    *,
+    stride: int = 4,
+    atom_gaussian_radius: float = 1.0,
+    atom_gaussian_sigma: float | None = None,
+    seed: int = 0,
+    random_conv_radius: float = 4.0,
+    device: str | torch.device | None = None,
+) -> tuple[Grid, NPArr(np.float32, "Nx_fine", "Ny_fine", "Nz_fine", "chan")]:
+  """Map a random-projected density field back to fine semantic score fields."""
+  field = np.asarray(field, dtype=np.float32)
+  output_channels = field.shape[-1]
+  must_be[(*grid.shape, output_channels)] = field.shape
+  fine_grid = _fine_grid_for_stride(grid, stride)
+
+  kernel = random_radial_conv_kernel_3d(
+    len(DENSFN_FORWARD_1_CHANNELS),
+    output_channels,
+    dx=fine_grid.dx,
+    radius=random_conv_radius,
+    seed=seed,
+  )
+  if device is None:
+    conv_device = torch.device("cpu")
+  else:
+    conv_device = torch.device(device)
+
+  field_tensor = torch.from_numpy(
+    np.moveaxis(field, -1, 0)[None, :, :, :, :]
+  ).to(conv_device)
+  kernel_tensor = torch.from_numpy(kernel).to(conv_device)
+  radius_grid = kernel.shape[-1] // 2
+  with torch.no_grad():
+    score_tensor = F.conv_transpose3d(
+      field_tensor,
+      kernel_tensor,
+      padding=radius_grid,
+      stride=stride,
+      output_padding=stride - 1,
+    )
+    must_be[(1, len(DENSFN_FORWARD_1_CHANNELS), *fine_grid.shape)] = score_tensor.shape
+    score_tensor = _gaussian_matched_filter_3d(
+      score_tensor,
+      fine_grid,
+      radius=atom_gaussian_radius,
+      sigma=atom_gaussian_sigma,
+    )
+
+  score_field = np.moveaxis(score_tensor.squeeze(0).cpu().numpy(), 0, -1)
+  return fine_grid, np.ascontiguousarray(score_field.astype(np.float32))
+
+
+def _extract_matched_score_peaks(
+    grid: Grid,
+    channel_field: NPArr(np.float32, "Nx", "Ny", "Nz"),
+    *,
+    rel_threshold: float = 0.25,
+    abs_threshold: float | None = None,
+    min_distance: float = 0.7,
+    max_peaks: int = 512,
+) -> list[_Peak]:
+  if rel_threshold < 0.0:
+    raise ValueError("rel_threshold must be non-negative")
+  if min_distance < 0.0:
+    raise ValueError("min_distance must be non-negative")
+  if max_peaks <= 0:
+    raise ValueError("max_peaks must be positive")
+
+  channel_field = np.asarray(channel_field, dtype=np.float32)
+  channel_max = float(channel_field.max(initial=0.0))
+  if abs_threshold is None:
+    threshold = rel_threshold * channel_max
+  else:
+    threshold = abs_threshold
+  if threshold <= 0.0:
+    threshold = np.nextafter(np.float32(0.0), np.float32(1.0)).item()
+
+  candidate_flat = np.flatnonzero(channel_field >= threshold)
+  if candidate_flat.size == 0:
+    return []
+  candidate_scores = channel_field.reshape(-1)[candidate_flat]
+  order = np.argsort(candidate_scores)[::-1]
+
+  suppress_radius = int(np.ceil(min_distance / grid.dx))
+  suppressed = np.zeros(channel_field.shape, dtype=bool)
+  peaks = []
+  for flat_i in candidate_flat[order]:
+    index = np.asarray(np.unravel_index(int(flat_i), channel_field.shape), dtype=np.int32)
+    if suppressed[tuple(index)]:
+      continue
+    value = float(channel_field[tuple(index)])
+    index_coord = index.astype(np.float32)
+    peaks.append(_Peak(index_coord, grid_index_to_coord(grid, index_coord), value))
+
+    lo = np.maximum(index - suppress_radius, 0)
+    hi = np.minimum(index + suppress_radius + 1, np.asarray(channel_field.shape, dtype=np.int32))
+    suppressed[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = True
+    if len(peaks) >= max_peaks:
+      break
+  return peaks
+
+
+def _extract_densfn_forward_2_peaks(
+    grid: Grid,
+    score_field: NPArr(np.float32, "Nx", "Ny", "Nz", "chan"),
+    *,
+    rel_threshold: float = 0.25,
+    abs_threshold: float | None = None,
+    min_distance: float = 0.7,
+    max_peaks_per_channel: int = 512,
+    channels: tuple[str, ...] | None = None,
+) -> dict[str, list[_Peak]]:
+  peaks = {}
+  peak_channels = channels or (
+    "backbone_ca",
+    "backbone_c",
+    "backbone_n",
+    "backbone_o",
+    "sidechain_n",
+    "sidechain_o",
+    "sidechain_s",
+    "sidechain_c_grey",
+    "sidechain_c_blue",
+  )
+  for channel in peak_channels:
+    channel_i = DENSFN_FORWARD_1_CHANNEL_INDEX[channel]
+    peaks[channel] = _extract_matched_score_peaks(
+      grid,
+      score_field[..., channel_i],
+      rel_threshold=rel_threshold,
+      abs_threshold=abs_threshold,
+      min_distance=min_distance,
+      max_peaks=max_peaks_per_channel,
+    )
+  return peaks
+
+
+def densfn_backward_2(
+    grid: Grid,
+    field: NPArr(np.float32, "Nx", "Ny", "Nz", "output_channels"),
+    *,
+    stride: int = 4,
+    atom_gaussian_radius: float = 1.0,
+    atom_gaussian_sigma: float | None = None,
+    seed: int = 0,
+    random_conv_radius: float = 4.0,
+    device: str | torch.device | None = None,
+    peak_rel_threshold: float = 0.25,
+    peak_abs_threshold: float | None = None,
+    peak_min_distance: float = 0.7,
+    max_peaks_per_channel: int = 512,
+) -> ProteinWithCodes:
+  """Initial decoder for densfn_forward_2 fields using matched-filter peaks."""
+  fine_grid, score_field = densfn_backward_2_score_fields(
+    grid,
+    field,
+    stride=stride,
+    atom_gaussian_radius=atom_gaussian_radius,
+    atom_gaussian_sigma=atom_gaussian_sigma,
+    seed=seed,
+    random_conv_radius=random_conv_radius,
+    device=device,
+  )
+  peaks = _extract_densfn_forward_2_peaks(
+    fine_grid,
+    score_field,
+    rel_threshold=peak_rel_threshold,
+    abs_threshold=peak_abs_threshold,
+    min_distance=peak_min_distance,
+    max_peaks_per_channel=max_peaks_per_channel,
+  )
+  return densfn_peaks_to_protein(
+    fine_grid,
+    peaks,
+    bond_field=score_field[..., DENSFN_FORWARD_1_CHANNEL_INDEX["backbone_bond"]],
+  )
 
 
 def _tent_weights(index_coord: NPArr(np.float32, 3), grid_shape) -> tuple[list[tuple[int, int, int]], np.ndarray]:
@@ -1042,6 +1445,79 @@ def _sidechain_atoms_for_assignment(aa, channel_assignments, residue):
   return atoms
 
 
+def densfn_peaks_to_protein(
+    grid: Grid,
+    peaks: dict[str, list[_Peak]],
+    *,
+    bond_field: NPArr(np.float32, "Nx", "Ny", "Nz") | None = None,
+) -> ProteinWithCodes:
+  """Assemble ProteinWithCodes from semantic channel peak candidates."""
+  residues = _assemble_backbone_residues(
+    peaks.get("backbone_n", []),
+    peaks.get("backbone_ca", []),
+    peaks.get("backbone_c", []),
+    peaks.get("backbone_o", []),
+  )
+  chains = _link_backbone_residues(
+    residues,
+    bond_field=bond_field,
+    grid=grid if bond_field is not None else None,
+  )
+  sidechain_assignments = _assign_sidechain_peaks_to_residues(chains, peaks)
+  decoded = []
+  for chain_i, chain in enumerate(chains):
+    decoded_chain = []
+    for residue_i, residue in enumerate(chain):
+      assignments = sidechain_assignments[(chain_i, residue_i)]
+      aa = _infer_residue_code(assignments)
+      decoded_chain.append((
+        aa,
+        {
+          "N": residue.n,
+          "CA": residue.ca,
+          "C": residue.c,
+          **({"O": residue.o} if residue.o is not None else {}),
+          **_sidechain_atoms_for_assignment(aa, assignments, residue),
+        },
+      ))
+    decoded.append(decoded_chain)
+  return decoded
+
+
+def densfn_candidates_to_peaks(
+    grid: Grid,
+    candidates: list[DensityCandidate],
+) -> dict[str, list[_Peak]]:
+  """Convert explicit channel/position candidates into reverser peak lists."""
+  peaks: dict[str, list[_Peak]] = {}
+  for candidate in candidates:
+    if candidate.channel not in DENSFN_FORWARD_1_CHANNEL_INDEX:
+      raise ValueError(f"unknown density channel {candidate.channel!r}")
+    coord = np.asarray(candidate.coord, dtype=np.float32)
+    must_be[3], = coord.shape
+    index_coord = coord_to_grid_index(grid, coord)
+    peaks.setdefault(candidate.channel, []).append(_Peak(
+      index_coord.astype(np.float32),
+      coord,
+      float(candidate.value),
+    ))
+  return peaks
+
+
+def densfn_candidates_to_protein(
+    grid: Grid,
+    candidates: list[DensityCandidate],
+    *,
+    bond_field: NPArr(np.float32, "Nx", "Ny", "Nz") | None = None,
+) -> ProteinWithCodes:
+  """Assemble ProteinWithCodes from explicit semantic atom candidates."""
+  return densfn_peaks_to_protein(
+    grid,
+    densfn_candidates_to_peaks(grid, candidates),
+    bond_field=bond_field,
+  )
+
+
 def densfn_backward_1(
     grid: Grid,
     field: NPArr(np.float32, "Nx", "Ny", "Nz", "chan"),
@@ -1067,33 +1543,8 @@ def densfn_backward_1(
       "sidechain_c_blue",
     ),
   )
-  residues = _assemble_backbone_residues(
-    peaks["backbone_n"],
-    peaks["backbone_ca"],
-    peaks["backbone_c"],
-    peaks["backbone_o"],
-  )
-  chains = _link_backbone_residues(
-    residues,
+  return densfn_peaks_to_protein(
+    grid,
+    peaks,
     bond_field=field[..., DENSFN_FORWARD_1_CHANNEL_INDEX["backbone_bond"]],
-    grid=grid,
   )
-  sidechain_assignments = _assign_sidechain_peaks_to_residues(chains, peaks)
-  decoded = []
-  for chain_i, chain in enumerate(chains):
-    decoded_chain = []
-    for residue_i, residue in enumerate(chain):
-      assignments = sidechain_assignments[(chain_i, residue_i)]
-      aa = _infer_residue_code(assignments)
-      decoded_chain.append((
-        aa,
-        {
-          "N": residue.n,
-          "CA": residue.ca,
-          "C": residue.c,
-          **({"O": residue.o} if residue.o is not None else {}),
-          **_sidechain_atoms_for_assignment(aa, assignments, residue),
-        },
-      ))
-    decoded.append(decoded_chain)
-  return decoded
