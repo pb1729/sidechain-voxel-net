@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 
 import torch
@@ -9,20 +9,24 @@ from umup_layers.residual_layers import ( LrScale,
 from util import must_be, annotate_path
 from source_save import get_current_source, source_dict_diff
 from big_convs_3d import gaussian_blur_3d, affine_gauss_conv_3d
+from density_fns import (
+  DensFn1, DensFn2, DensityFunction,
+  density_function_from_dict, density_function_to_dict,
+)
 
 
 CIF_DATASET_PATH = "cath-cif"
-SAVE_PATH = "models/flownet_8.pt"
+SAVE_PATH = "models/flownet_10.pt"
 
 
 @dataclass
 class FlowConfig:
   batch:int
-  chan_dens:int
+  densfn:DensityFunction
   chan_L_list:list[tuple[int, int]]
   blur_list:list[float]
   lr:float = 0.05
-  intensity_ratio:float = 20.
+  intensity_ratio:float = 2000.
   autocast:bool = False
   
 
@@ -99,7 +103,7 @@ class UNet3d(nn.Module):
     super().__init__()
     self.N = len(conf.chan_L_list)
     chan_0 = conf.chan_L_list[0][0]
-    self.readin = LinearReadinWithBias(conf.chan_dens, chan_0)
+    self.readin = LinearReadinWithBias(conf.densfn.channel_count(), chan_0)
     self.input_residuals = nn.ModuleList([
       UMUPResiduals(L, lambda j: UMUPTanhGatedPlus(chan, t_depend=True))
       for chan, L in conf.chan_L_list
@@ -116,7 +120,8 @@ class UNet3d(nn.Module):
       UMUPResiduals(L, lambda j: UMUPTanhGatedPlus(chan, t_depend=True))
       for chan, L in conf.chan_L_list
     ])
-    self.readout = UMUPConv3d(chan_0, conf.chan_dens, (1, 1, 1), (0, 0, 0), readout=True)
+    self.readout = UMUPConv3d(
+      chan_0, conf.densfn.channel_count(), (1, 1, 1), (0, 0, 0), readout=True)
   def forward(self, x, t):
     """ x: (batch, chan_latent, H, W, L)
         t: (batch, 1, H, W, L) """
@@ -147,21 +152,28 @@ class FlowModel:
     self.optim = None
   def to(self, device):
     self.model.to(device)
+    if isinstance(self.conf.densfn, DensFn2):
+      self.conf.densfn = replace(self.conf.densfn, device=str(device))
     return self
   def record(self, i:int, nm:str, val):
     if nm not in self.history:
       self.history[nm] = []
     self.history[nm].append((i, val))
   def to_dict(self):
+    conf = vars(self.conf).copy()
+    conf["densfn"] = density_function_to_dict(self.conf.densfn)
     return {
       "history": self.history,
-      "conf": vars(self.conf),
+      "conf": conf,
       "model": self.model.state_dict(),
       "source": self.source,
     }
   @staticmethod
   def from_dict(d):
-    ans = FlowModel(FlowConfig(**d["conf"]))
+    conf = d["conf"].copy()
+    if isinstance(conf["densfn"], dict):
+      conf["densfn"] = density_function_from_dict(conf["densfn"])
+    ans = FlowModel(FlowConfig(**conf))
     ans.history = d["history"]
     ans.model.load_state_dict(d["model"])
     curr_source = ans.source
@@ -213,7 +225,7 @@ class FlowModel:
     self.record(i, "grid_dims", x.shape[-3:])
   def infer(self, ε, steps=32):
     self.model.eval()
-    batch, must_be[self.conf.chan_dens], gx, gy, gz = ε.shape
+    batch, must_be[self.conf.densfn.channel_count()], gx, gy, gz = ε.shape
     for i in range(steps):
       t_value = (0.5 + i)/steps
       t = t_value + torch.zeros(batch, device=ε.device)
@@ -226,9 +238,8 @@ class FlowModel:
 
 if __name__ == "__main__":
   from density_dataset import make_density_batch_loader
-  from density_fns import DensFn1
   batch = 1
-  densfn = DensFn1()
+  densfn = DensFn2(atom_gaussian_radius=1.5, output_channels=24, device="cuda", conv_method="fft", fft_phase_batch_size=2)
   chan_L_list = [(64, 5), (128, 5), (256, 5), (512, 4)]
   autocast = True
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -236,7 +247,7 @@ if __name__ == "__main__":
   print(SAVE_PATH)
   conf = FlowConfig(
     batch,
-    densfn.channel_count(),
+    densfn,
     chan_L_list,
     [2., 4., 6., 8.],
     autocast=autocast,
@@ -245,7 +256,7 @@ if __name__ == "__main__":
   i = 0
   for epoch in range(40):
     flowmodel.record(i, "start_epoch", epoch)
-    dataloader = make_density_batch_loader(CIF_DATASET_PATH, conf.batch, densfn=densfn)
+    dataloader = make_density_batch_loader(CIF_DATASET_PATH, conf.batch, densfn=conf.densfn)
     for x in dataloader:
       x = x.to(device)
       flowmodel.step(i, x)
@@ -256,4 +267,3 @@ if __name__ == "__main__":
       i += 1
     torch.save(flowmodel.to_dict(), annotate_path(SAVE_PATH, f"epoch_{epoch}"))
   torch.save(flowmodel.to_dict(), SAVE_PATH)
-

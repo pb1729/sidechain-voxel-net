@@ -133,10 +133,12 @@ class DensFn2:
       grid: "Grid",
       field: NPArr(np.float32, "Nx", "Ny", "Nz", "output_channels"),
       *,
-      peak_rel_threshold: float = 0.25,
+      peak_rel_threshold: float = 0.5,
       peak_abs_threshold: float | None = None,
       peak_min_distance: float = 0.7,
       max_peaks_per_channel: int = 512,
+      peaks_per_round: int = 32,
+      batch_min_distance: float = 3.0,
   ) -> ProteinWithCodes:
     return densfn_backward_2(
       grid,
@@ -153,10 +155,35 @@ class DensFn2:
       peak_abs_threshold=peak_abs_threshold,
       peak_min_distance=peak_min_distance,
       max_peaks_per_channel=max_peaks_per_channel,
+      peaks_per_round=peaks_per_round,
+      batch_min_distance=batch_min_distance,
     )
 
 
 DensityFunction = DensFn1 | DensFn2
+
+
+def density_function_to_dict(densfn: DensityFunction) -> dict:
+  """Return a checkpoint-friendly description of a density function."""
+  if isinstance(densfn, DensFn1):
+    return {"type": "DensFn1", "params": {}}
+  if isinstance(densfn, DensFn2):
+    params = dict(vars(densfn))
+    if params["device"] is not None:
+      params["device"] = str(params["device"])
+    return {"type": "DensFn2", "params": params}
+  raise TypeError(f"unsupported density function: {type(densfn).__name__}")
+
+
+def density_function_from_dict(data: dict) -> DensityFunction:
+  """Reconstruct a density function from ``density_function_to_dict`` output."""
+  densfn_type = data.get("type")
+  params = data.get("params", {})
+  if densfn_type == "DensFn1":
+    return DensFn1(**params)
+  if densfn_type == "DensFn2":
+    return DensFn2(**params)
+  raise ValueError(f"unknown density function type: {densfn_type!r}")
 
 
 GREY_CARBON = "grey"
@@ -1064,6 +1091,34 @@ def densfn_forward_2(
       sigma=atom_gaussian_sigma,
     )
 
+  field = _project_densfn_forward_2_fine_field(
+    fine_grid,
+    fine_field,
+    output_channels=output_channels,
+    stride=stride,
+    seed=seed,
+    random_conv_radius=random_conv_radius,
+    device=device,
+    conv_method=conv_method,
+    fft_phase_batch_size=fft_phase_batch_size,
+  )
+  must_be[(*grid.shape, output_channels)] = field.shape
+  return grid, field
+
+
+def _project_densfn_forward_2_fine_field(
+    fine_grid: Grid,
+    fine_field: NPArr(np.float32, "Nx_fine", "Ny_fine", "Nz_fine", "chan"),
+    *,
+    output_channels: int,
+    stride: int,
+    seed: int,
+    random_conv_radius: float,
+    device: str | torch.device | None,
+    conv_method: Literal["direct", "fft"],
+    fft_phase_batch_size: int | None,
+) -> NPArr(np.float32, "Nx", "Ny", "Nz", "output_channels"):
+  """Project a fine semantic field through the DensFn2 random convolution."""
   kernel = random_radial_conv_kernel_3d(
     len(DENSFN_FORWARD_2_CHANNELS),
     output_channels,
@@ -1099,8 +1154,64 @@ def densfn_forward_2(
     else:
       raise ValueError(f"unknown conv_method {conv_method!r}")
   field = np.moveaxis(output.squeeze(0).cpu().numpy(), 0, -1)
-  must_be[(*grid.shape, output_channels)] = field.shape
-  return grid, np.ascontiguousarray(field.astype(np.float32))
+  return np.ascontiguousarray(field.astype(np.float32))
+
+
+def _densfn_forward_2_local_atom_projection(
+    grid: Grid,
+    fine_index: NPArr(np.int32, 3),
+    channel_i: int,
+    *,
+    kernel_tensor: torch.Tensor,
+    stride: int,
+    atom_gaussian_radius: float,
+    atom_gaussian_sigma: float | None,
+) -> tuple[NPArr(np.int32, 3), np.ndarray]:
+  """Project one quantized atom on a stride-aligned local fine-grid patch."""
+  fine_grid = _fine_grid_for_stride(grid, stride)
+  gaussian_radius_grid = int(np.ceil(atom_gaussian_radius / fine_grid.dx))
+  conv_radius_grid = kernel_tensor.shape[-1] // 2
+  halo = gaussian_radius_grid + conv_radius_grid
+  fine_index = np.asarray(fine_index, dtype=np.int32)
+  fine_origin = np.floor_divide(fine_index - halo, stride) * stride
+  fine_stop = np.floor_divide(fine_index + halo + stride, stride) * stride
+  local_shape = fine_stop - fine_origin
+
+  transform = (
+    np.eye(4, dtype=np.float32)
+    if grid.transform is None
+    else np.asarray(grid.transform).copy()
+  )
+  transform[:3, 3] -= fine_origin.astype(np.float32) * fine_grid.dx
+  local_grid = Grid(
+    dx=fine_grid.dx,
+    N=local_shape.astype(np.int32),
+    transform=transform,
+  )
+  local_field = density_field(local_grid, 1)
+  vector = np.ones((1, 1), dtype=np.float32)
+  coord = grid_index_to_coord(fine_grid, fine_index.astype(np.float32))
+  add_gaussian_atom_densities(
+    local_field,
+    local_grid,
+    coord[None, :],
+    vector,
+    radius=atom_gaussian_radius,
+    sigma=atom_gaussian_sigma,
+  )
+  local_tensor = torch.from_numpy(
+    np.moveaxis(local_field, -1, 0)[None, :, :, :, :]
+  ).to(kernel_tensor.device)
+  with torch.no_grad():
+    output = F.conv3d(
+      local_tensor,
+      kernel_tensor[:, channel_i:channel_i + 1],
+      padding=conv_radius_grid,
+      stride=stride,
+    )
+  projection = np.moveaxis(output.squeeze(0).cpu().numpy(), 0, -1)
+  projection = np.ascontiguousarray(projection.astype(np.float32))
+  return np.floor_divide(fine_origin, stride), projection
 
 
 def _fine_grid_for_stride(grid: Grid, stride: int) -> Grid:
@@ -1315,32 +1426,140 @@ def densfn_backward_2(
     device: str | torch.device | None = None,
     conv_method: Literal["direct", "fft"] = "direct",
     fft_phase_batch_size: int | None = 8,
-    peak_rel_threshold: float = 0.25,
+    peak_rel_threshold: float = 0.5,
     peak_abs_threshold: float | None = None,
     peak_min_distance: float = 0.7,
     max_peaks_per_channel: int = 512,
+    peaks_per_round: int = 32,
+    batch_min_distance: float = 3.0,
 ) -> ProteinWithCodes:
-  """Initial decoder for densfn_forward_2 fields using matched-filter peaks."""
-  fine_grid, score_field = densfn_backward_2_score_fields(
-    grid,
-    field,
-    stride=stride,
-    atom_gaussian_radius=atom_gaussian_radius,
-    atom_gaussian_sigma=atom_gaussian_sigma,
+  """Decode DensFn2 by iterative matched scoring and exact residual subtraction."""
+  if peak_rel_threshold < 0.0:
+    raise ValueError("peak_rel_threshold must be non-negative")
+  if peak_min_distance < 0.0:
+    raise ValueError("peak_min_distance must be non-negative")
+  if max_peaks_per_channel <= 0:
+    raise ValueError("max_peaks_per_channel must be positive")
+  if peaks_per_round <= 0:
+    raise ValueError("peaks_per_round must be positive")
+  if batch_min_distance < 0.0:
+    raise ValueError("batch_min_distance must be non-negative")
+
+  field = np.asarray(field, dtype=np.float32)
+  must_be[(*grid.shape, field.shape[-1])] = field.shape
+  residual = np.ascontiguousarray(field.copy())
+  fine_grid = _fine_grid_for_stride(grid, stride)
+  peaks = {channel: [] for channel in DENSFN_FORWARD_2_CHANNELS}
+  conv_device = torch.device("cpu" if device is None else device)
+  local_kernel_tensor = torch.from_numpy(random_radial_conv_kernel_3d(
+    len(DENSFN_FORWARD_2_CHANNELS),
+    field.shape[-1],
+    dx=fine_grid.dx,
+    radius=random_conv_radius,
     seed=seed,
-    random_conv_radius=random_conv_radius,
-    device=device,
-    conv_method=conv_method,
-    fft_phase_batch_size=fft_phase_batch_size,
-  )
-  peaks = _extract_densfn_forward_2_peaks(
-    fine_grid,
-    score_field,
-    rel_threshold=peak_rel_threshold,
-    abs_threshold=peak_abs_threshold,
-    min_distance=peak_min_distance,
-    max_peaks_per_channel=max_peaks_per_channel,
-  )
+  )).to(conv_device)
+  initial_maxima = None
+  max_rounds = max_peaks_per_channel
+
+  for _round_i in range(max_rounds):
+    fine_grid, score_field = densfn_backward_2_score_fields(
+      grid,
+      residual,
+      stride=stride,
+      atom_gaussian_radius=atom_gaussian_radius,
+      atom_gaussian_sigma=atom_gaussian_sigma,
+      seed=seed,
+      random_conv_radius=random_conv_radius,
+      device=device,
+      conv_method=conv_method,
+      fft_phase_batch_size=fft_phase_batch_size,
+    )
+    if initial_maxima is None:
+      initial_maxima = {
+        channel: float(score_field[..., DENSFN_FORWARD_2_CHANNEL_INDEX[channel]].max())
+        for channel in DENSFN_FORWARD_2_CHANNELS
+      }
+
+    round_peaks = {}
+    for channel in DENSFN_FORWARD_2_CHANNELS:
+      remaining = max_peaks_per_channel - len(peaks[channel])
+      if remaining <= 0:
+        round_peaks[channel] = []
+        continue
+      threshold = (
+        peak_abs_threshold
+        if peak_abs_threshold is not None
+        else peak_rel_threshold * initial_maxima[channel]
+      )
+      channel_i = DENSFN_FORWARD_2_CHANNEL_INDEX[channel]
+      candidates = _extract_matched_score_peaks(
+        fine_grid,
+        score_field[..., channel_i],
+        rel_threshold=0.0,
+        abs_threshold=threshold,
+        min_distance=peak_min_distance,
+        max_peaks=min(peaks_per_round, remaining),
+      )
+      round_peaks[channel] = [
+        peak for peak in candidates
+        if all(_dist(peak.coord, old_peak.coord) >= peak_min_distance
+               for old_peak in peaks[channel])
+      ]
+
+    ranked_round_peaks = sorted(
+      (
+        peak.value / max(initial_maxima[channel], np.finfo(np.float32).tiny),
+        channel,
+        peak,
+      )
+      for channel, channel_peaks in round_peaks.items()
+      for peak in channel_peaks
+    )
+    accepted_positions = []
+    separated_round_peaks = {channel: [] for channel in DENSFN_FORWARD_2_CHANNELS}
+    for _relative_score, channel, peak in reversed(ranked_round_peaks):
+      if any(_dist(peak.coord, position) < batch_min_distance
+             for position in accepted_positions):
+        continue
+      separated_round_peaks[channel].append(peak)
+      accepted_positions.append(peak.coord)
+    round_peaks = separated_round_peaks
+
+    if not accepted_positions:
+      break
+
+    for channel, channel_peaks in round_peaks.items():
+      channel_i = DENSFN_FORWARD_2_CHANNEL_INDEX[channel]
+      for peak in channel_peaks:
+        fine_index = np.rint(peak.index_coord).astype(np.int32)
+        coarse_origin, projection = _densfn_forward_2_local_atom_projection(
+          grid,
+          fine_index,
+          channel_i,
+          kernel_tensor=local_kernel_tensor,
+          stride=stride,
+          atom_gaussian_radius=atom_gaussian_radius,
+          atom_gaussian_sigma=atom_gaussian_sigma,
+        )
+        projection_stop = coarse_origin + np.asarray(projection.shape[:3], dtype=np.int32)
+        target_lo = np.maximum(coarse_origin, 0)
+        target_hi = np.minimum(projection_stop, np.asarray(grid.N, dtype=np.int32))
+        source_lo = target_lo - coarse_origin
+        source_hi = source_lo + (target_hi - target_lo)
+        residual[
+          target_lo[0]:target_hi[0],
+          target_lo[1]:target_hi[1],
+          target_lo[2]:target_hi[2],
+          :,
+        ] -= projection[
+          source_lo[0]:source_hi[0],
+          source_lo[1]:source_hi[1],
+          source_lo[2]:source_hi[2],
+          :,
+        ]
+    for channel in DENSFN_FORWARD_2_CHANNELS:
+      peaks[channel].extend(round_peaks[channel])
+
   return densfn_peaks_to_protein(
     fine_grid,
     peaks,
