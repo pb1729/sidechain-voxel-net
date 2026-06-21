@@ -1159,7 +1159,7 @@ def _project_densfn_forward_2_fine_field(
 
 def _densfn_forward_2_local_atom_projection(
     grid: Grid,
-    fine_index: NPArr(np.int32, 3),
+    fine_index: NPArr(np.float32, 3),
     channel_i: int,
     *,
     kernel_tensor: torch.Tensor,
@@ -1172,9 +1172,9 @@ def _densfn_forward_2_local_atom_projection(
   gaussian_radius_grid = int(np.ceil(atom_gaussian_radius / fine_grid.dx))
   conv_radius_grid = kernel_tensor.shape[-1] // 2
   halo = gaussian_radius_grid + conv_radius_grid
-  fine_index = np.asarray(fine_index, dtype=np.int32)
-  fine_origin = np.floor_divide(fine_index - halo, stride) * stride
-  fine_stop = np.floor_divide(fine_index + halo + stride, stride) * stride
+  fine_index = np.asarray(fine_index, dtype=np.float32)
+  fine_origin = np.floor((fine_index - halo) / stride).astype(np.int32) * stride
+  fine_stop = np.ceil((fine_index + halo + 1.0) / stride).astype(np.int32) * stride
   local_shape = fine_stop - fine_origin
 
   transform = (
@@ -1190,7 +1190,7 @@ def _densfn_forward_2_local_atom_projection(
   )
   local_field = density_field(local_grid, 1)
   vector = np.ones((1, 1), dtype=np.float32)
-  coord = grid_index_to_coord(fine_grid, fine_index.astype(np.float32))
+  coord = grid_index_to_coord(fine_grid, fine_index)
   add_gaussian_atom_densities(
     local_field,
     local_grid,
@@ -1379,6 +1379,34 @@ def _extract_matched_score_peaks(
   return peaks
 
 
+def _refine_matched_score_peak(
+    grid: Grid,
+    channel_field: NPArr(np.float32, "Nx", "Ny", "Nz"),
+    peak: _Peak,
+) -> _Peak:
+  """Refine an integer matched-score maximum with a local quadratic model."""
+  center = np.rint(peak.index_coord).astype(np.int32)
+  shape = np.asarray(channel_field.shape, dtype=np.int32)
+  if np.any(center <= 0) or np.any(center >= shape - 1):
+    return peak
+
+  ix, iy, iz = center
+  f0 = float(channel_field[ix, iy, iz])
+  offset = np.zeros(3, dtype=np.float64)
+  for axis in range(3):
+    minus = center.copy()
+    plus = center.copy()
+    minus[axis] -= 1
+    plus[axis] += 1
+    fm = float(channel_field[tuple(minus)])
+    fp = float(channel_field[tuple(plus)])
+    curvature = fm - 2.0 * f0 + fp
+    if curvature < 0.0:
+      offset[axis] = np.clip(0.5 * (fm - fp) / curvature, -0.5, 0.5)
+  refined_index = center.astype(np.float32) + offset.astype(np.float32)
+  return _Peak(refined_index, grid_index_to_coord(grid, refined_index), f0)
+
+
 def _extract_densfn_forward_2_peaks(
     grid: Grid,
     score_field: NPArr(np.float32, "Nx", "Ny", "Nz", "chan"),
@@ -1459,7 +1487,7 @@ def densfn_backward_2(
     seed=seed,
   )).to(conv_device)
   initial_maxima = None
-  max_rounds = max_peaks_per_channel
+  max_rounds = 4 * ((max_peaks_per_channel + peaks_per_round - 1) // peaks_per_round)
 
   for _round_i in range(max_rounds):
     fine_grid, score_field = densfn_backward_2_score_fields(
@@ -1558,7 +1586,13 @@ def densfn_backward_2(
           :,
         ]
     for channel in DENSFN_FORWARD_2_CHANNELS:
-      peaks[channel].extend(round_peaks[channel])
+      channel_i = DENSFN_FORWARD_2_CHANNEL_INDEX[channel]
+      peaks[channel].extend(
+        _refine_matched_score_peak(
+          fine_grid, score_field[..., channel_i], peak
+        )
+        for peak in round_peaks[channel]
+      )
 
   return densfn_peaks_to_protein(
     fine_grid,
