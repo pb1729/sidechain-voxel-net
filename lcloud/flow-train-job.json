@@ -1,0 +1,70 @@
+{
+  "name": "cath-s40-flow-train",
+  "instance_type": "gpu_1x_a10",
+  "region": "us-east-1",
+  "ssh_key_name": "heaviside-dev",
+  "ssh_private_key": "~/.ssh/id_ed25519",
+  "timeout_seconds": 14400,
+  "setup_allowance_seconds": 3600,
+  "stop_grace_seconds": 30,
+  "command": "set -euo pipefail; cd /home/ubuntu/cath_s40; bash scripts/lambda_flow_setup.sh; source env/bin/activate; python -u train_flow_model_remote.py --profile full --dataset /lambda/nfs/research/datasets/cath-cif --output-dir /home/ubuntu/cath_s40_flow_output --save-name flownet_remote.pt --epochs 40 --save-every 10 --batch 2 --resume",
+  "workdir": "/home/ubuntu/cath_s40",
+  "job_user": "ubuntu",
+  "filesystem": "research",
+  "uploads": [
+    {
+      "source": "big_convs_3d.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "density_dataset.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "density_fns.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "parse_cif.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "source_save.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "train_flow_model.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "train_flow_model_remote.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "util.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "requirements-remote.txt",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "scripts/",
+      "destination": "/home/ubuntu/cath_s40/scripts/"
+    },
+    {
+      "source": "umup_layers/",
+      "destination": "/home/ubuntu/cath_s40/umup_layers/"
+    }
+  ],
+  "checkpoint": {
+    "source": "/home/ubuntu/cath_s40_flow_output",
+    "destination": "runs/cath_s40_flow/checkpoints",
+    "interval_seconds": 300,
+    "sync_timeout_seconds": 300,
+    "exclude": [
+      "*.tmp",
+      "*.partial"
+    ]
+  }
+}

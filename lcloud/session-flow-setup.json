@@ -1,0 +1,60 @@
+{
+  "name": "cath-s40-flow-setup",
+  "instance_type": "gpu_1x_a10",
+  "region": "us-east-1",
+  "ssh_key_name": "heaviside-dev",
+  "ssh_private_key": "~/.ssh/id_ed25519",
+  "max_lifetime_seconds": 14400,
+  "filesystem": "research",
+  "uploads": [
+    {
+      "source": "big_convs_3d.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "density_dataset.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "density_fns.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "parse_cif.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "source_save.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "train_flow_model.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "train_flow_model_remote.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "util.py",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "requirements-remote.txt",
+      "destination": "/home/ubuntu/cath_s40/"
+    },
+    {
+      "source": "scripts/",
+      "destination": "/home/ubuntu/cath_s40/scripts/"
+    },
+    {
+      "source": "umup_layers/",
+      "destination": "/home/ubuntu/cath_s40/umup_layers/"
+    }
+  ],
+  "setup_commands": [
+    "cd /home/ubuntu/cath_s40 && bash scripts/lambda_flow_setup.sh",
+    "sudo mkdir -p /lambda/nfs/research/runs/cath_s40_flow/sanity && sudo chown -R ubuntu:ubuntu /lambda/nfs/research/runs/cath_s40_flow",
+    "cd /home/ubuntu/cath_s40 && source env/bin/activate && python -u train_flow_model_remote.py --profile sanity --dataset /lambda/nfs/research/datasets/cath-cif --output-dir /lambda/nfs/research/runs/cath_s40_flow/sanity --save-name sanity.pt --epochs 1 --max-steps 2 --save-every 1 --batch 1"
+  ]
+}

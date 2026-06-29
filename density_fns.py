@@ -12,7 +12,10 @@ from parse_cif import ATOM_IDENTITY_ELEMENTS, ProteinWithCodes, Z2CoordPair
 
 def NPArr(dtype, *shape):
   """ Type annotation for np array of given dtype and shape. """
-  return np.ndarray[tuple[tuple([Literal[dim] for dim in shape])], np.dtype[dtype]]
+  try:
+    return np.ndarray[tuple[tuple([Literal[dim] for dim in shape])], np.dtype[dtype]]
+  except TypeError:
+    return np.ndarray
 
 def vec3(x, y ,z):
   return np.array([x, y, z])
