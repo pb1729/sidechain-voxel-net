@@ -26,6 +26,8 @@ class FlowConfig:
   chan_L_list:list[tuple[int, int]]
   blur_list:list[float]
   lr:float = 0.05
+  lr_warmup_steps:int = 1000
+  lr_decay_per_epoch:float = 0.8
   intensity_ratio:float = 2000.
   autocast:bool = False
   
@@ -149,6 +151,25 @@ class FlowModel:
     self.model = UNet3d(conf)
     self.source = get_current_source()
     self.optim = None
+  def ensure_optim(self):
+    if self.optim is None:
+      self.optim = torch.optim.Adam(
+        scale_param_lrs(self.conf.lr, get_param_groups(self.model)),
+        betas=(0.9, 0.999)
+      )
+      for group in self.optim.param_groups:
+        group["base_lr"] = group["lr"]
+  def lr_multiplier(self, i:int, epoch:int):
+    warmup_steps = max(0, self.conf.lr_warmup_steps)
+    if warmup_steps > 0 and i < warmup_steps:
+      return (i + 1)/warmup_steps
+    return self.conf.lr_decay_per_epoch**epoch
+  def update_learning_rate(self, i:int, epoch:int):
+    self.ensure_optim()
+    multiplier = self.lr_multiplier(i, epoch)
+    for group in self.optim.param_groups:
+      group["lr"] = group["base_lr"]*multiplier
+    return multiplier
   def to(self, device):
     self.model.to(device)
     if isinstance(self.conf.densfn, DensFn2):
@@ -188,13 +209,9 @@ class FlowModel:
       print(source_diff["changed"][chg]["diff"])
     # return the answer
     return ans
-  def step(self, i:int, x):
+  def step(self, i:int, x, epoch:int=0):
     """ MUTATES self """
-    if self.optim is None:
-      self.optim = torch.optim.Adam(
-        scale_param_lrs(self.conf.lr, get_param_groups(self.model)),
-        betas=(0.9, 0.999)
-      )
+    lr_multiplier = self.update_learning_rate(i, epoch)
     # make tensors smaller so we don't run out of memory
     gx, gy, gz = x.shape[-3:]
     crop_x, crop_y, crop_z = max(1, (gx - 48)//2), max(1, (gy - 48)//2), max(1, (gz - 48)//2)
@@ -222,6 +239,8 @@ class FlowModel:
     self.record(i, "blur_sqerrs", [sqerr.item() for sqerr in sqerrs])
     self.record(i, "loss", loss.item())
     self.record(i, "grid_dims", x.shape[-3:])
+    self.record(i, "lr_multiplier", lr_multiplier)
+    self.record(i, "lr", self.conf.lr*lr_multiplier)
   def infer(self, ε, steps=32):
     self.model.eval()
     batch, must_be[self.conf.densfn.channel_count()], gx, gy, gz = ε.shape
@@ -258,7 +277,7 @@ if __name__ == "__main__":
     dataloader = make_density_batch_loader(CIF_DATASET_PATH, conf.batch, densfn=conf.densfn)
     for x in dataloader:
       x = x.to(device)
-      flowmodel.step(i, x)
+      flowmodel.step(i, x, epoch=epoch)
       _, loss = flowmodel.history["loss"][-1]
       print(f"{i}  loss={loss}")
       if i % 10 == 0:

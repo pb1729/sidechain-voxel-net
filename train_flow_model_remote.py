@@ -51,6 +51,10 @@ def latest_step(flowmodel: FlowModel) -> int:
     return max((i for values in flowmodel.history.values() for i, _value in values), default=-1) + 1
 
 
+def next_epoch(flowmodel: FlowModel) -> int:
+    return max((epoch for _i, epoch in flowmodel.history.get("start_epoch", [])), default=-1) + 1
+
+
 def is_cuda_oom(error: RuntimeError) -> bool:
     message = str(error).lower()
     return (
@@ -90,6 +94,7 @@ def train_one_step(
     dataloader_iter,
     flowmodel: FlowModel,
     step: int,
+    epoch: int,
     device: torch.device,
     profile_path: Path | None,
     profile_with_stack: bool,
@@ -97,7 +102,7 @@ def train_one_step(
     def run_step() -> None:
         x = next(dataloader_iter)
         x = x.to(device)
-        flowmodel.step(step, x)
+        flowmodel.step(step, x, epoch=epoch)
 
     if profile_path is None:
         run_step()
@@ -176,12 +181,14 @@ def main() -> None:
         print("resuming:", save_path, flush=True)
         flowmodel = FlowModel.from_dict(torch.load(save_path, map_location=device)).to(device)
         i = latest_step(flowmodel)
+        first_epoch = next_epoch(flowmodel)
     else:
         flowmodel = FlowModel(make_config(args, device)).to(device)
         i = 0
+        first_epoch = 0
 
     stop_training = False
-    for epoch in range(args.epochs):
+    for epoch in range(first_epoch, args.epochs):
         flowmodel.record(i, "start_epoch", epoch)
         while True:
             retry_epoch = False
@@ -204,6 +211,7 @@ def main() -> None:
                         dataloader_iter=dataloader_iter,
                         flowmodel=flowmodel,
                         step=i,
+                        epoch=epoch,
                         device=device,
                         profile_path=profile_path,
                         profile_with_stack=args.torch_profile_with_stack,
